@@ -2,6 +2,7 @@
 
 #include "camera.h"
 #include "object3d.h"
+#include "renderer.h"
 #include "resource.h"
 
 #include <memory>
@@ -15,6 +16,7 @@ public:
   App(std::filesystem::path appDir);
   ~App();
   void run();
+  void setRenderMode(RenderMode mode);
 
 private:
   void initWindow();

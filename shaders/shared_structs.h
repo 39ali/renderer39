@@ -54,8 +54,10 @@ struct InstanceData {
   vec4 translationScaleX;
   vec4 rotation;
   vec2 scaleYZ;
+  // index of the mesh's first triangle in meshletTriangles/triangleMeshlets;
+  // ray tracing primitive indices are relative to it.
+  uint firstTriangle;
   uint padding0;
-  uint padding1;
 };
 
 // 32 bytes
@@ -134,7 +136,12 @@ struct DrawPushConstants {
   uint environmentTexture;
   float environmentIntensity;
   float environmentMaxMip;
+  // path tracer: samples accumulated so far (0 restarts accumulation)
+  uint sampleIndex;
+  uint maxBounces;
   uint padding2;
+  uint padding3;
+  uint padding4;
 };
 
 SHARED_INLINE uint meshletVertexCount(
@@ -224,7 +231,9 @@ static_assert(offsetof(Material, alphaMode) == 68);
 static_assert(sizeof(MeshletInstance) == 8);
 static_assert(sizeof(RenderCounters) == 8);
 
-static_assert(sizeof(DrawPushConstants) == 208);
+static_assert(sizeof(DrawPushConstants) == 224);
+static_assert(offsetof(DrawPushConstants, sampleIndex) == 204);
+static_assert(offsetof(DrawPushConstants, maxBounces) == 208);
 static_assert(offsetof(DrawPushConstants, environmentTexture) == 192);
 static_assert(offsetof(DrawPushConstants, view) == 64);
 static_assert(offsetof(DrawPushConstants, frustum) == 128);

@@ -29,9 +29,6 @@ struct HdrImage {
 struct GltfModel {
   std::vector<VertexPosition> positions;
   std::vector<VertexAttributes> attributes;
-  // flat triangle list into positions/attributes; kept on the CPU for
-  // acceleration structure builds.
-  std::vector<uint32_t> indices;
   std::vector<uint32_t> meshletVertexRefs;
   std::vector<uint32_t> meshletTriangles;
   // materialIndex indexes materials

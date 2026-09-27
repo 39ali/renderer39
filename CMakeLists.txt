@@ -83,6 +83,8 @@ set(SHADER_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/meshlet.frag.hlsl
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sky.vert.hlsl
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sky.frag.hlsl
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/present.frag.hlsl
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/pathtrace.comp.hlsl
 )
 
 set(SHADER_INCLUDES
@@ -91,6 +93,7 @@ set(SHADER_INCLUDES
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/brdf.hlsli
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/environment.hlsli
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/tonemap.hlsli
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sampling.hlsli
 )
 
 set(SPIRV_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
@@ -105,6 +108,8 @@ foreach(shader ${SHADER_SOURCES})
     set(shader_profile as_6_6)
   elseif (shader_stage STREQUAL ".mesh")
     set(shader_profile ms_6_6)
+  elseif (shader_stage STREQUAL ".comp")
+    set(shader_profile cs_6_6)
   elseif (shader_stage STREQUAL ".frag")
     set(shader_profile ps_6_6)
   else()
@@ -130,6 +135,7 @@ add_executable(vktest
   src/app.cpp
   src/camera.cpp
   src/renderer.cpp
+  src/raytracing.cpp
   src/resource.cpp
   src/vk_context.cpp
   ${imgui_SOURCE_DIR}/imgui.cpp

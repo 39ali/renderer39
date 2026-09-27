@@ -4,6 +4,9 @@
 #include "math_helper.h"
 
 #include <array>
+#include <cstring>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_vulkan.h>
@@ -23,12 +26,18 @@ enum Binding : uint32_t {
   kBindingMaterials = 8,
   kBindingSampler = 9,
   kBindingTextures = 10,
-  kBindingCount = 11,
+  kBindingTlas = 11,
+  kBindingAccumulation = 12,
+  kBindingTriangleMeshlets = 13,
+  kBindingCount = 14,
 };
-constexpr uint32_t kStorageBufferBindingCount = 9;
-constexpr VkShaderStageFlags kDrawStages = VK_SHADER_STAGE_TASK_BIT_EXT |
-                                           VK_SHADER_STAGE_MESH_BIT_EXT |
-                                           VK_SHADER_STAGE_FRAGMENT_BIT;
+// bindings 0..8 and kBindingTriangleMeshlets
+constexpr uint32_t kStorageBufferBindingCount = 10;
+// every shader stage shares one pipeline layout
+constexpr VkShaderStageFlags kDrawStages =
+    VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT |
+    VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
+constexpr VkFormat kAccumulationFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
 
 const char *const kDebugViewNames[] = {
     "lit",       "base color", "normal",   "metallic",
@@ -44,13 +53,15 @@ std::string formatNumber(uint64_t value) {
   return text;
 }
 
-InstanceData makeInstanceData(const Object3D &object) {
+InstanceData makeInstanceData(const Object3D &object,
+                              const MeshUploadInfo &mesh) {
   return {
       .translationScaleX = {object.position.x, object.position.y,
                             object.position.z, object.scale.x},
       .rotation = {object.rotation.x, object.rotation.y, object.rotation.z,
                    object.rotation.w},
       .scaleYZ = {object.scale.y, object.scale.z},
+      .firstTriangle = mesh.firstTriangle,
   };
 }
 
@@ -65,9 +76,29 @@ void Renderer::init() {
   _vkContext.init();
   createDescriptorSetLayout();
   createGraphicsPipeline();
+  createPathTracingPipeline();
   createDescriptorPool();
   createDescriptorSet();
   createSampler();
+
+  const RenderTargetInfo renderTarget = _vkContext.renderTargetInfo();
+  _accumulationImage = _vkContext.createStorageImage(
+      renderTarget.extent.width, renderTarget.extent.height,
+      kAccumulationFormat);
+  VkDescriptorImageInfo accumulationInfo{
+      .imageView = _accumulationImage.view,
+      .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+  };
+  VkWriteDescriptorSet accumulationWrite{
+      .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+      .dstSet = _descriptorSet,
+      .dstBinding = kBindingAccumulation,
+      .descriptorCount = 1,
+      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+      .pImageInfo = &accumulationInfo,
+  };
+  vkUpdateDescriptorSets(_vkContext.device(), 1, &accumulationWrite, 0,
+                         nullptr);
   for (Buffer<RenderCounters> &buffer : _renderBucket.counterReadbackBuffers) {
     _vkContext.createBuffer(sizeof(RenderCounters),
                             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -92,6 +123,9 @@ void Renderer::cleanup() {
     _vkContext.destroyBuffer(_instanceBuffer);
     _vkContext.destroyBuffer(_materialBuffer);
     _vkContext.destroyBuffer(_meshletTriangleBuffer);
+    _vkContext.destroyBuffer(_triangleMeshletBuffer);
+    _vkContext.destroyTexture(_accumulationImage);
+    _rayTracingScene.destroy();
     _vkContext.destroyBuffer(_meshletVertexRefBuffer);
     _vkContext.destroyBuffer(_vertexAttributeBuffer);
     _vkContext.destroyBuffer(_vertexPositionBuffer);
@@ -101,6 +135,8 @@ void Renderer::cleanup() {
     }
     vkDestroySampler(_vkContext.device(), _materialSampler, nullptr);
     vkDestroyPipeline(_vkContext.device(), _skyPipeline, nullptr);
+    vkDestroyPipeline(_vkContext.device(), _presentPipeline, nullptr);
+    vkDestroyPipeline(_vkContext.device(), _pathTracingPipeline, nullptr);
     vkDestroyPipeline(_vkContext.device(), _graphicsPipeline, nullptr);
     vkDestroyPipelineLayout(_vkContext.device(), _pipelineLayout, nullptr);
     vkDestroyDescriptorPool(_vkContext.device(), _descriptorPool, nullptr);
@@ -113,7 +149,7 @@ void Renderer::cleanup() {
 void Renderer::createDescriptorSetLayout() {
   std::array<VkDescriptorSetLayoutBinding, kBindingCount> bindings{};
   std::array<VkDescriptorBindingFlags, kBindingCount> bindingFlags{};
-  for (uint32_t binding = 0; binding < kStorageBufferBindingCount; ++binding) {
+  for (uint32_t binding = 0; binding <= kBindingMaterials; ++binding) {
     bindings[binding] = {
         .binding = binding,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -121,18 +157,36 @@ void Renderer::createDescriptorSetLayout() {
         .stageFlags = kDrawStages,
     };
   }
+  bindings[kBindingTriangleMeshlets] = {
+      .binding = kBindingTriangleMeshlets,
+      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+      .descriptorCount = 1,
+      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+  };
+  bindings[kBindingTlas] = {
+      .binding = kBindingTlas,
+      .descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
+      .descriptorCount = 1,
+      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+  };
+  bindings[kBindingAccumulation] = {
+      .binding = kBindingAccumulation,
+      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+      .descriptorCount = 1,
+      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+  };
   bindings[kBindingSampler] = {
       .binding = kBindingSampler,
       .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
       .descriptorCount = 1,
-      .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+      .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
   };
   // bindless: only the first _textures.size() entries are ever written
   bindings[kBindingTextures] = {
       .binding = kBindingTextures,
       .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
       .descriptorCount = kMaxTextures,
-      .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+      .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
   };
   bindingFlags[kBindingTextures] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
 
@@ -325,6 +379,23 @@ void Renderer::createGraphicsPipeline() {
                                 &skyPipelineInfo, nullptr, &_skyPipeline);
   assert(createSkyPipelineResult == VK_SUCCESS &&
          "failed to create sky pipeline");
+  // the path tracer's output: same fullscreen triangle, no depth test
+  const VkShaderModule presentFragShaderModule = _vkContext.createShaderModule(
+      _resources.readBinary("shaders/present.frag.spv"));
+  std::array<VkPipelineShaderStageCreateInfo, 2> presentStages = skyStages;
+  presentStages[1].module = presentFragShaderModule;
+  VkPipelineDepthStencilStateCreateInfo presentDepthStencil = skyDepthStencil;
+  presentDepthStencil.depthTestEnable = VK_FALSE;
+  VkGraphicsPipelineCreateInfo presentPipelineInfo = skyPipelineInfo;
+  presentPipelineInfo.pStages = presentStages.data();
+  presentPipelineInfo.pDepthStencilState = &presentDepthStencil;
+  const VkResult createPresentPipelineResult =
+      vkCreateGraphicsPipelines(_vkContext.device(), VK_NULL_HANDLE, 1,
+                                &presentPipelineInfo, nullptr,
+                                &_presentPipeline);
+  assert(createPresentPipelineResult == VK_SUCCESS &&
+         "failed to create present pipeline");
+  vkDestroyShaderModule(_vkContext.device(), presentFragShaderModule, nullptr);
   vkDestroyShaderModule(_vkContext.device(), skyFragShaderModule, nullptr);
   vkDestroyShaderModule(_vkContext.device(), skyVertShaderModule, nullptr);
 
@@ -385,7 +456,15 @@ void Renderer::createImgui() {
 }
 
 void Renderer::createDescriptorPool() {
-  const std::array<VkDescriptorPoolSize, 3> poolSizes{{
+  const std::array<VkDescriptorPoolSize, 5> poolSizes{{
+      {
+          .type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
+          .descriptorCount = 1,
+      },
+      {
+          .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+          .descriptorCount = 1,
+      },
       {
           .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
           .descriptorCount = kStorageBufferBindingCount,
@@ -482,7 +561,10 @@ void Renderer::updateInstanceDescriptorSet() {
 }
 
 void Renderer::updateMeshDescriptorSet() {
-  const std::array<std::pair<Binding, VkDescriptorBufferInfo>, 6> buffers{{
+  const std::array<std::pair<Binding, VkDescriptorBufferInfo>, 7> buffers{{
+      {kBindingTriangleMeshlets,
+       {.buffer = _triangleMeshletBuffer.buffer,
+        .range = sizeof(uint32_t) * _triangleMeshlets.size()}},
       {kBindingMeshlets,
        {.buffer = _meshletBuffer.buffer,
         .range = sizeof(Meshlet) * _meshlets.size()}},
@@ -583,6 +665,7 @@ MeshId Renderer::loadModel(const GltfModel &model) {
       static_cast<uint32_t>(_meshletVertexRefs.size());
   const uint32_t meshletTriangleBase =
       static_cast<uint32_t>(_meshletTriangles.size());
+  info.firstTriangle = meshletTriangleBase;
   const uint32_t materialBase = static_cast<uint32_t>(_materials.size());
   const uint32_t textureBase = static_cast<uint32_t>(_textures.size());
   assert(textureBase + model.textures.size() <= kMaxTextures);
@@ -591,9 +674,6 @@ MeshId Renderer::loadModel(const GltfModel &model) {
                           model.positions.end());
   _vertexAttributes.insert(_vertexAttributes.end(), model.attributes.begin(),
                            model.attributes.end());
-  for (const uint32_t index : model.indices) {
-    _indices.push_back(vertexBase + index);
-  }
   for (const uint32_t vertexRef : model.meshletVertexRefs) {
     _meshletVertexRefs.push_back(vertexBase + vertexRef);
   }
@@ -605,6 +685,9 @@ MeshId Renderer::loadModel(const GltfModel &model) {
     meshlet.vertexOffset += meshletVertexRefBase;
     meshlet.triangleOffset += meshletTriangleBase;
     meshlet.materialIndex += materialBase;
+    _triangleMeshlets.insert(_triangleMeshlets.end(),
+                             meshletTriangleCount(meshlet),
+                             static_cast<uint32_t>(_meshlets.size()));
     _meshlets.push_back(meshlet);
   }
 
@@ -626,6 +709,7 @@ MeshId Renderer::loadModel(const GltfModel &model) {
   _meshes.push_back(info);
 
   rebuildMeshBuffers();
+  buildBlas(info);
   return static_cast<MeshId>(_meshes.size() - 1);
 }
 
@@ -636,6 +720,26 @@ void Renderer::uploadTextures(const std::vector<TextureData> &textures) {
         texture.srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM,
         texture.rgba.data()));
   }
+}
+
+void Renderer::buildBlas(const MeshUploadInfo &mesh) {
+  // triangles in meshlet order, so a BLAS primitive index plus
+  // mesh.firstTriangle addresses _meshletTriangles and _triangleMeshlets
+  std::vector<uint32_t> indices;
+  for (uint32_t meshletId = mesh.firstMeshlet;
+       meshletId < mesh.firstMeshlet + mesh.meshletCount; ++meshletId) {
+    const Meshlet &meshlet = _meshlets[meshletId];
+    for (uint32_t t = 0; t < meshletTriangleCount(meshlet); ++t) {
+      const uint32_t packed = _meshletTriangles[meshlet.triangleOffset + t];
+      for (uint32_t corner = 0; corner < 3; ++corner) {
+        const uint32_t local = (packed >> (corner * 10u)) & 0x3ffu;
+        indices.push_back(_meshletVertexRefs[meshlet.vertexOffset + local]);
+      }
+    }
+  }
+  _rayTracingScene.addMesh(_vertexPositionBuffer.buffer,
+                           static_cast<uint32_t>(_vertexPositions.size()),
+                           indices);
 }
 
 void Renderer::setEnvironment(const HdrImage &image) {
@@ -661,8 +765,14 @@ void Renderer::rebuildMeshBuffers() {
   _vkContext.waitIdle();
   uploadDeviceLocalBuffer(_meshlets, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                           _meshletBuffer);
-  uploadDeviceLocalBuffer(_vertexPositions, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                          _vertexPositionBuffer);
+  uploadDeviceLocalBuffer(
+      _vertexPositions,
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+          VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+          VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+      _vertexPositionBuffer);
+  uploadDeviceLocalBuffer(_triangleMeshlets, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                          _triangleMeshletBuffer);
   uploadDeviceLocalBuffer(_vertexAttributes,
                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                           _vertexAttributeBuffer);
@@ -686,7 +796,8 @@ void Renderer::setObjects(const std::vector<Object3D> &objects) {
     assert(object.meshId < _meshes.size() && "invalid object mesh id");
 
     const uint32_t instanceId = static_cast<uint32_t>(_frameInstances.size());
-    _frameInstances.push_back(makeInstanceData(object));
+    _frameInstances.push_back(
+        makeInstanceData(object, _meshes[object.meshId]));
 
     const MeshUploadInfo &mesh = _meshes[object.meshId];
     for (uint32_t meshletOffset = 0; meshletOffset < mesh.meshletCount;
@@ -731,6 +842,51 @@ void Renderer::setObjects(const std::vector<Object3D> &objects) {
   vmaUnmapMemory(_vkContext.allocator(), _instanceBuffer.allocation);
 
   uploadRenderBucket();
+
+  std::vector<VkAccelerationStructureInstanceKHR> tlasInstances;
+  tlasInstances.reserve(objects.size());
+  for (size_t i = 0; i < objects.size(); ++i) {
+    const Object3D &object = objects[i];
+    const glm::mat4 transform =
+        glm::translate(glm::mat4(1.0f), object.position) *
+        glm::mat4_cast(object.rotation) *
+        glm::scale(glm::mat4(1.0f), object.scale);
+    VkTransformMatrixKHR matrix{};
+    for (int row = 0; row < 3; ++row) {
+      for (int column = 0; column < 4; ++column) {
+        matrix.matrix[row][column] = transform[column][row];
+      }
+    }
+    tlasInstances.push_back({
+        .transform = matrix,
+        // the path tracer indexes instances[] with this
+        .instanceCustomIndex = static_cast<uint32_t>(i),
+        .mask = 0xff,
+        .instanceShaderBindingTableRecordOffset = 0,
+        .flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR,
+        // replaced by the BLAS address in buildTlas
+        .accelerationStructureReference = object.meshId,
+    });
+  }
+  _rayTracingScene.buildTlas(std::move(tlasInstances));
+
+  const VkAccelerationStructureKHR tlas = _rayTracingScene.tlas();
+  VkWriteDescriptorSetAccelerationStructureKHR tlasInfo{
+      .sType =
+          VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,
+      .accelerationStructureCount = 1,
+      .pAccelerationStructures = &tlas,
+  };
+  VkWriteDescriptorSet tlasWrite{
+      .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+      .pNext = &tlasInfo,
+      .dstSet = _descriptorSet,
+      .dstBinding = kBindingTlas,
+      .descriptorCount = 1,
+      .descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
+  };
+  vkUpdateDescriptorSets(_vkContext.device(), 1, &tlasWrite, 0, nullptr);
+  _sampleIndex = 0;
 }
 
 template <typename T>
@@ -911,6 +1067,16 @@ void Renderer::renderImgui(VkCommandBuffer commandBuffer, float dt) {
               totalTriangles.c_str());
 
   ImGui::Separator();
+  int renderMode = static_cast<int>(_renderMode);
+  ImGui::RadioButton("raster", &renderMode, 0);
+  ImGui::SameLine();
+  ImGui::RadioButton("path tracing", &renderMode, 1);
+  _renderMode = static_cast<RenderMode>(renderMode);
+  if (_renderMode == RenderMode::PathTracing) {
+    ImGui::Text("samples: %u", _sampleIndex);
+    ImGui::SetNextItemWidth(160.0f);
+    ImGui::SliderInt("max bounces", &_maxBounces, 0, 16);
+  }
   int debugView = static_cast<int>(_debugView);
   ImGui::SetNextItemWidth(160.0f);
   if (ImGui::Combo("view", &debugView, kDebugViewNames,
@@ -933,10 +1099,7 @@ void Renderer::renderImgui(VkCommandBuffer commandBuffer, float dt) {
 }
 
 void Renderer::recordRenderingCommands(VkCommandBuffer commandBuffer,
-                                       const FrameContext &frame,
-                                       const glm::mat4 &viewProjection,
-                                       const CameraCullData &cullData,
-                                       float dt) {
+                                       const FrameContext &frame, float dt) {
   std::array<VkImageMemoryBarrier, 2> beginRenderingBarriers{{
       {
           .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -1007,36 +1170,20 @@ void Renderer::recordRenderingCommands(VkCommandBuffer commandBuffer,
 
   // rendering
   vkCmdBeginRendering(commandBuffer, &renderingInfo);
-  vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                    _graphicsPipeline);
+  vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          _pipelineLayout, 0, 1, &_descriptorSet, 0, nullptr);
+  vkCmdPushConstants(commandBuffer, _pipelineLayout, kDrawStages, 0,
+                     sizeof(DrawPushConstants), &_pushConstants);
 
-  if (!_candidateMeshlets.empty()) {
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            _pipelineLayout, 0, 1, &_descriptorSet, 0, nullptr);
-    const float azimuth = glm::radians(_lightAzimuth);
-    const float elevation = glm::radians(_lightElevation);
-    const glm::vec3 towardsLight{std::cos(elevation) * std::sin(azimuth),
-                                 std::sin(elevation),
-                                 std::cos(elevation) * std::cos(azimuth)};
-    DrawPushConstants pushConstants{
-        .viewProjection = viewProjection,
-        .view = cullData.view,
-        .frustum = cullData.frustum,
-        .zNearFar = cullData.zNearFar,
-        .candidateCount = static_cast<uint32_t>(_candidateMeshlets.size()),
-        .debugView = _debugView,
-        .cameraPosition = glm::vec4(glm::vec3(glm::inverse(cullData.view)[3]),
-                                    1.0f),
-        .lightDirection = glm::vec4(-towardsLight, _lightIntensity),
-        .environmentTexture = _environmentTexture,
-        .environmentIntensity = _environmentIntensity,
-        .environmentMaxMip = _environmentMaxMip,
-    };
-    vkCmdPushConstants(commandBuffer, _pipelineLayout, kDrawStages, 0,
-                       sizeof(DrawPushConstants), &pushConstants);
-
+  if (_renderMode == RenderMode::PathTracing) {
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      _presentPipeline);
+    vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+  } else if (!_candidateMeshlets.empty()) {
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      _graphicsPipeline);
     const uint32_t groupCount =
-        (pushConstants.candidateCount + kTaskGroupSize - 1) / kTaskGroupSize;
+        (_pushConstants.candidateCount + kTaskGroupSize - 1) / kTaskGroupSize;
     _vkContext.cmdDrawMeshTasks(
         commandBuffer, minValue(groupCount, kTaskGroupsPerRow),
         (groupCount + kTaskGroupsPerRow - 1) / kTaskGroupsPerRow, 1);
@@ -1072,9 +1219,7 @@ void Renderer::recordRenderingCommands(VkCommandBuffer commandBuffer,
                        nullptr, 1, &presentBarrier);
 }
 
-void Renderer::recordCommandBuffer(const FrameContext &frame,
-                                   const glm::mat4 &viewProjection,
-                                   const CameraCullData &cullData, float dt) {
+void Renderer::recordCommandBuffer(const FrameContext &frame, float dt) {
   VkCommandBuffer commandBuffer = frame.commandBuffer;
   VkCommandBufferBeginInfo beginInfo{
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -1085,7 +1230,10 @@ void Renderer::recordCommandBuffer(const FrameContext &frame,
          "failed to begin recording command buffer");
 
   recordCounterReset(commandBuffer);
-  recordRenderingCommands(commandBuffer, frame, viewProjection, cullData, dt);
+  if (_renderMode == RenderMode::PathTracing) {
+    recordPathTracing(commandBuffer);
+  }
+  recordRenderingCommands(commandBuffer, frame, dt);
   recordCounterReadback(
       commandBuffer,
       _renderBucket.counterReadbackBuffers[frame.frameIndex].buffer);
@@ -1099,6 +1247,102 @@ void Renderer::render(const glm::mat4 &viewProjection,
                       const CameraCullData &cullData, float dt) {
   const FrameContext frame = _vkContext.beginFrame();
   readCompletedCounters(frame.frameIndex);
-  recordCommandBuffer(frame, viewProjection, cullData, dt);
+
+  _pushConstants = makePushConstants(viewProjection, cullData);
+  if (_renderMode == RenderMode::PathTracing) {
+    // any change to what the image depends on restarts accumulation
+    DrawPushConstants state = _pushConstants;
+    state.debugView = 0;
+    if (std::memcmp(&state, &_accumulatedState, sizeof(state)) != 0) {
+      _accumulatedState = state;
+      _sampleIndex = 0;
+    }
+    _pushConstants.sampleIndex = _sampleIndex;
+  }
+
+  recordCommandBuffer(frame, dt);
   _vkContext.endFrame(frame);
+  if (_renderMode == RenderMode::PathTracing) {
+    ++_sampleIndex;
+  } else {
+    // re-entering path tracing starts from scratch
+    _accumulatedState = {};
+  }
+}
+
+DrawPushConstants
+Renderer::makePushConstants(const glm::mat4 &viewProjection,
+                            const CameraCullData &cullData) const {
+  const float azimuth = glm::radians(_lightAzimuth);
+  const float elevation = glm::radians(_lightElevation);
+  const glm::vec3 towardsLight{std::cos(elevation) * std::sin(azimuth),
+                               std::sin(elevation),
+                               std::cos(elevation) * std::cos(azimuth)};
+  return {
+      .viewProjection = viewProjection,
+      .view = cullData.view,
+      .frustum = cullData.frustum,
+      .zNearFar = cullData.zNearFar,
+      .candidateCount = static_cast<uint32_t>(_candidateMeshlets.size()),
+      .debugView = _debugView,
+      .cameraPosition =
+          glm::vec4(glm::vec3(glm::inverse(cullData.view)[3]), 1.0f),
+      .lightDirection = glm::vec4(-towardsLight, _lightIntensity),
+      .environmentTexture = _environmentTexture,
+      .environmentIntensity = _environmentIntensity,
+      .environmentMaxMip = _environmentMaxMip,
+      .maxBounces = static_cast<uint32_t>(_maxBounces),
+  };
+}
+
+void Renderer::recordPathTracing(VkCommandBuffer commandBuffer) {
+  // the previous frame's present pass reads the image this dispatch writes
+  VkMemoryBarrier readBeforeWrite{
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+      .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+  };
+  vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                       &readBeforeWrite, 0, nullptr, 0, nullptr);
+
+  vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    _pathTracingPipeline);
+  vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          _pipelineLayout, 0, 1, &_descriptorSet, 0, nullptr);
+  vkCmdPushConstants(commandBuffer, _pipelineLayout, kDrawStages, 0,
+                     sizeof(DrawPushConstants), &_pushConstants);
+  const RenderTargetInfo renderTarget = _vkContext.renderTargetInfo();
+  vkCmdDispatch(commandBuffer, (renderTarget.extent.width + 7) / 8,
+                (renderTarget.extent.height + 7) / 8, 1);
+
+  VkMemoryBarrier writeBeforeRead{
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+  };
+  vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1,
+                       &writeBeforeRead, 0, nullptr, 0, nullptr);
+}
+
+void Renderer::createPathTracingPipeline() {
+  const VkShaderModule shaderModule = _vkContext.createShaderModule(
+      _resources.readBinary("shaders/pathtrace.comp.spv"));
+  VkComputePipelineCreateInfo pipelineInfo{
+      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+      .stage =
+          {
+              .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+              .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+              .module = shaderModule,
+              .pName = "main",
+          },
+      .layout = _pipelineLayout,
+  };
+  const VkResult result =
+      vkCreateComputePipelines(_vkContext.device(), VK_NULL_HANDLE, 1,
+                               &pipelineInfo, nullptr, &_pathTracingPipeline);
+  assert(result == VK_SUCCESS && "failed to create path tracing pipeline");
+  vkDestroyShaderModule(_vkContext.device(), shaderModule, nullptr);
 }

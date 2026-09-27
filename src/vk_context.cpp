@@ -8,6 +8,7 @@
 #include <cassert>
 #include <cstring>
 #include <iostream>
+#include <type_traits>
 
 namespace {
 
@@ -18,6 +19,9 @@ const std::vector<const char *> kValidationLayers = {
 const std::vector<const char *> kDeviceExtensions = {
     VK_KHR_SWAPCHAIN_EXTENSION_NAME,
     VK_EXT_MESH_SHADER_EXTENSION_NAME,
+    VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+    VK_KHR_RAY_QUERY_EXTENSION_NAME,
+    VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
 };
 
 #ifdef NDEBUG
@@ -380,13 +384,25 @@ void VkContext::createLogicalDevice() {
       .taskShader = VK_TRUE,
       .meshShader = VK_TRUE,
   };
+  VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
+      .pNext = &meshShaderFeatures,
+      .rayQuery = VK_TRUE,
+  };
+  VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures{
+      .sType =
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
+      .pNext = &rayQueryFeatures,
+      .accelerationStructure = VK_TRUE,
+  };
   VkPhysicalDeviceVulkan12Features vulkan12Features{
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-      .pNext = &meshShaderFeatures,
+      .pNext = &accelerationStructureFeatures,
       // bindless texture array
       .shaderSampledImageArrayNonUniformIndexing = VK_TRUE,
       .descriptorBindingPartiallyBound = VK_TRUE,
       .runtimeDescriptorArray = VK_TRUE,
+      .bufferDeviceAddress = VK_TRUE,
   };
   VkPhysicalDeviceVulkan13Features vulkan13Features{
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
@@ -398,7 +414,10 @@ void VkContext::createLogicalDevice() {
   VkPhysicalDeviceFeatures2 deviceFeatures{
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
       .pNext = &vulkan13Features,
-      .features = {.samplerAnisotropy = VK_TRUE},
+      // fragmentStoresAndAtomics: the present pass reads the path tracer's
+      // storage image, which DXC does not mark read-only
+      .features = {.samplerAnisotropy = VK_TRUE,
+                   .fragmentStoresAndAtomics = VK_TRUE},
   };
   VkDeviceCreateInfo createInfo{
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
@@ -425,12 +444,46 @@ void VkContext::createLogicalDevice() {
   _vkCmdDrawMeshTasksEXT = reinterpret_cast<PFN_vkCmdDrawMeshTasksEXT>(
       vkGetDeviceProcAddr(_device, "vkCmdDrawMeshTasksEXT"));
   assert(_vkCmdDrawMeshTasksEXT && "vkCmdDrawMeshTasksEXT not available");
+
+  const auto load = [this](auto &function, const char *name) {
+    function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(
+        vkGetDeviceProcAddr(_device, name));
+    assert(function && "ray tracing entry point not available");
+  };
+  load(_rayTracing.createAccelerationStructure,
+       "vkCreateAccelerationStructureKHR");
+  load(_rayTracing.destroyAccelerationStructure,
+       "vkDestroyAccelerationStructureKHR");
+  load(_rayTracing.getAccelerationStructureBuildSizes,
+       "vkGetAccelerationStructureBuildSizesKHR");
+  load(_rayTracing.getAccelerationStructureDeviceAddress,
+       "vkGetAccelerationStructureDeviceAddressKHR");
+  load(_rayTracing.cmdBuildAccelerationStructures,
+       "vkCmdBuildAccelerationStructuresKHR");
+  load(_rayTracing.cmdWriteAccelerationStructuresProperties,
+       "vkCmdWriteAccelerationStructuresPropertiesKHR");
+  load(_rayTracing.cmdCopyAccelerationStructure,
+       "vkCmdCopyAccelerationStructureKHR");
+
+  VkPhysicalDeviceAccelerationStructurePropertiesKHR
+      accelerationStructureProperties{
+          .sType =
+              VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR,
+      };
+  VkPhysicalDeviceProperties2 properties{
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+      .pNext = &accelerationStructureProperties,
+  };
+  vkGetPhysicalDeviceProperties2(_physicalDevice, &properties);
+  _scratchAlignment =
+      accelerationStructureProperties.minAccelerationStructureScratchOffsetAlignment;
 }
 
 void VkContext::createAllocator() {
   VmaAllocatorCreateInfo allocatorInfo{
       .flags = VMA_ALLOCATOR_CREATE_KHR_DEDICATED_ALLOCATION_BIT |
-               VMA_ALLOCATOR_CREATE_KHR_BIND_MEMORY2_BIT,
+               VMA_ALLOCATOR_CREATE_KHR_BIND_MEMORY2_BIT |
+               VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
       .physicalDevice = _physicalDevice,
       .device = _device,
       .instance = _instance,
@@ -880,6 +933,62 @@ Texture VkContext::createTexture(uint32_t width, uint32_t height,
   texture.view = createImageView(texture.image, format, mipLevels,
                                  VK_IMAGE_ASPECT_COLOR_BIT);
   return texture;
+}
+
+Texture VkContext::createStorageImage(uint32_t width, uint32_t height,
+                                      VkFormat format) {
+  VkImageCreateInfo imageInfo{
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = VK_IMAGE_TYPE_2D,
+      .format = format,
+      .extent = {.width = width, .height = height, .depth = 1},
+      .mipLevels = 1,
+      .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = VK_IMAGE_USAGE_STORAGE_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+  };
+  VmaAllocationCreateInfo allocationInfo{
+      .usage = VMA_MEMORY_USAGE_AUTO,
+      .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+  };
+  Texture image;
+  const VkResult createImageResult =
+      vmaCreateImage(_allocator, &imageInfo, &allocationInfo, &image.image,
+                     &image.allocation, nullptr);
+  assert(createImageResult == VK_SUCCESS && "failed to create storage image");
+
+  immediateSubmit([&](VkCommandBuffer commandBuffer) {
+    VkImageMemoryBarrier barrier{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image.image,
+        .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                             .levelCount = 1,
+                             .layerCount = 1},
+    };
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &barrier);
+  });
+
+  image.view =
+      createImageView(image.image, format, 1, VK_IMAGE_ASPECT_COLOR_BIT);
+  return image;
+}
+
+VkDeviceAddress VkContext::bufferAddress(VkBuffer buffer) const {
+  VkBufferDeviceAddressInfo info{
+      .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+      .buffer = buffer,
+  };
+  return vkGetBufferDeviceAddress(_device, &info);
 }
 
 void VkContext::destroyTexture(Texture &texture) const {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <functional>
 #include <optional>
 #include <vector>
@@ -36,6 +37,21 @@ struct Texture {
   VkImageView view = VK_NULL_HANDLE;
 };
 
+// extension entry points are not exported by the loader
+struct RayTracingFunctions {
+  PFN_vkCreateAccelerationStructureKHR createAccelerationStructure = nullptr;
+  PFN_vkDestroyAccelerationStructureKHR destroyAccelerationStructure = nullptr;
+  PFN_vkGetAccelerationStructureBuildSizesKHR
+      getAccelerationStructureBuildSizes = nullptr;
+  PFN_vkGetAccelerationStructureDeviceAddressKHR
+      getAccelerationStructureDeviceAddress = nullptr;
+  PFN_vkCmdBuildAccelerationStructuresKHR cmdBuildAccelerationStructures =
+      nullptr;
+  PFN_vkCmdWriteAccelerationStructuresPropertiesKHR
+      cmdWriteAccelerationStructuresProperties = nullptr;
+  PFN_vkCmdCopyAccelerationStructureKHR cmdCopyAccelerationStructure = nullptr;
+};
+
 template <typename T> struct Buffer {
   VkBuffer buffer = VK_NULL_HANDLE;
   VmaAllocation allocation = VK_NULL_HANDLE;
@@ -65,10 +81,14 @@ public:
   Texture createTexture(uint32_t width, uint32_t height, VkFormat format,
                         const void *pixels, uint32_t bytesPerPixel = 4);
   void destroyTexture(Texture &texture) const;
+  // a single-mip image left in VK_IMAGE_LAYOUT_GENERAL
+  Texture createStorageImage(uint32_t width, uint32_t height, VkFormat format);
+  VkDeviceAddress bufferAddress(VkBuffer buffer) const;
   void waitIdle() const;
   template <typename T>
   void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
-                    VkMemoryPropertyFlags properties, Buffer<T> &buffer) const;
+                    VkMemoryPropertyFlags properties, Buffer<T> &buffer,
+                    VkDeviceSize minAlignment = 0) const;
   template <typename T> void destroyBuffer(Buffer<T> &buffer) const;
 
   VkDevice device() const { return _device; }
@@ -81,6 +101,10 @@ public:
   }
   uint32_t swapChainImageCount() const {
     return static_cast<uint32_t>(_swapChainImages.size());
+  }
+  const RayTracingFunctions &rayTracing() const { return _rayTracing; }
+  VkDeviceSize accelerationStructureScratchAlignment() const {
+    return _scratchAlignment;
   }
   void cmdDrawMeshTasks(VkCommandBuffer commandBuffer, uint32_t groupCountX,
                        uint32_t groupCountY, uint32_t groupCountZ) const {
@@ -169,6 +193,8 @@ private:
   size_t _currentFrame = 0;
   // extension entry points are not exported by the loader
   PFN_vkCmdDrawMeshTasksEXT _vkCmdDrawMeshTasksEXT = nullptr;
+  RayTracingFunctions _rayTracing;
+  VkDeviceSize _scratchAlignment = 0;
 
 public:
   GLFWwindow *_window = nullptr;
@@ -177,7 +203,8 @@ public:
 template <typename T>
 void VkContext::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
                              VkMemoryPropertyFlags properties,
-                             Buffer<T> &buffer) const {
+                             Buffer<T> &buffer,
+                             VkDeviceSize minAlignment) const {
   VkBufferCreateInfo bufferInfo{
       .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
       .size = size,
@@ -197,9 +224,9 @@ void VkContext::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
                        : VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
   }
 
-  const VkResult createBufferResult =
-      vmaCreateBuffer(_allocator, &bufferInfo, &allocationInfo, &buffer.buffer,
-                      &buffer.allocation, nullptr);
+  const VkResult createBufferResult = vmaCreateBufferWithAlignment(
+      _allocator, &bufferInfo, &allocationInfo, minAlignment, &buffer.buffer,
+      &buffer.allocation, nullptr);
   assert(createBufferResult == VK_SUCCESS && "failed to create buffer");
 }
 

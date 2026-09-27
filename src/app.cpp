@@ -54,9 +54,10 @@ void App::initScene() {
   for (const SceneModel &sceneModel : sceneModels) {
     const GltfModel model = _resources.loadGltfModel(sceneModel.path);
     std::cout << sceneModel.path << ": " << model.meshlets.size()
-              << " meshlets, " << model.indices.size() / 3 << " triangles, "
+              << " meshlets, " << model.meshletTriangles.size()
+              << " triangles, "
               << model.materials.size() << " materials, "
-              << model.textures.size() << " textures\n";
+              << model.textures.size() << " textures" << std::endl;
 
     Object3D object(_renderer->loadModel(model));
     const float scale =
@@ -72,6 +73,8 @@ void App::initScene() {
   _camera.lookAt(glm::vec3{0.0f, 0.5f, 5.0f}, glm::vec3{0.0f});
   _renderer->setObjects(_objects);
 }
+
+void App::setRenderMode(RenderMode mode) { _renderer->setRenderMode(mode); }
 
 void App::run() {
   auto previousTime = std::chrono::steady_clock::now();

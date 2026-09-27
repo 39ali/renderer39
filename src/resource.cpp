@@ -410,9 +410,6 @@ private:
           primitive.normals[i], primitive.tangents[i],
           primitive.uvs.empty() ? glm::vec2(0.0f) : primitive.uvs[i]));
     }
-    for (const uint32_t index : primitive.indices) {
-      _result.indices.push_back(vertexBase + index);
-    }
     buildMeshlets(primitive, vertexBase);
   }
 

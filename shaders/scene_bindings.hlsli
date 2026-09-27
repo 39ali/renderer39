@@ -17,6 +17,11 @@
 [[vk::binding(8, 0)]] StructuredBuffer<Material> materials;
 [[vk::binding(9, 0)]] SamplerState materialSampler;
 [[vk::binding(10, 0)]] Texture2D textures[];
+[[vk::binding(11, 0)]] RaytracingAccelerationStructure sceneTlas;
+// path tracer output: running average of radiance
+[[vk::binding(12, 0)]] RWTexture2D<float4> accumulation;
+// meshlet id of every triangle, in meshletTriangles order
+[[vk::binding(13, 0)]] StructuredBuffer<uint> triangleMeshlets;
 
 // the mesh shader output and fragment shader input
 struct VertexOutput {

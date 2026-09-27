@@ -9,8 +9,8 @@
 #include <chrono>
 #include <iostream>
 
-constexpr uint32_t kWidth = 1920;
-constexpr uint32_t kHeight = 1080;
+constexpr uint32_t kWidth = 1920 * 1.5;
+constexpr uint32_t kHeight = 1080 * 1.5;
 
 App::App(std::filesystem::path appDir) : _resources(appDir) {
 

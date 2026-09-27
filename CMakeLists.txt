@@ -81,12 +81,16 @@ set(SHADER_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/meshlet.task.hlsl
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/meshlet.mesh.hlsl
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/meshlet.frag.hlsl
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sky.vert.hlsl
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sky.frag.hlsl
 )
 
 set(SHADER_INCLUDES
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/shared_structs.h
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene_bindings.hlsli
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/brdf.hlsli
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/environment.hlsli
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/tonemap.hlsli
 )
 
 set(SPIRV_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
@@ -95,7 +99,9 @@ file(MAKE_DIRECTORY ${SPIRV_BINARY_DIR})
 foreach(shader ${SHADER_SOURCES})
   get_filename_component(shader_name ${shader} NAME_WLE)
   get_filename_component(shader_stage ${shader_name} LAST_EXT)
-  if (shader_stage STREQUAL ".task")
+  if (shader_stage STREQUAL ".vert")
+    set(shader_profile vs_6_6)
+  elseif (shader_stage STREQUAL ".task")
     set(shader_profile as_6_6)
   elseif (shader_stage STREQUAL ".mesh")
     set(shader_profile ms_6_6)

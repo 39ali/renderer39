@@ -598,6 +598,35 @@ Resources::readBinary(const std::filesystem::path &path) const {
   return buffer;
 }
 
+HdrImage Resources::loadHdrImage(const std::filesystem::path &path) const {
+  const std::string resolvedPath = (_baseDir / path).string();
+  int width = 0;
+  int height = 0;
+  int channels = 0;
+  float *pixels = stbi_loadf(resolvedPath.c_str(), &width, &height, &channels,
+                             STBI_rgb_alpha);
+  if (!pixels) {
+    std::cerr << "failed to load HDR " << resolvedPath << ": "
+              << stbi_failure_reason() << '\n';
+    assert(false && "failed to load HDR image");
+    return {};
+  }
+
+  HdrImage image{
+      .width = static_cast<uint32_t>(width),
+      .height = static_cast<uint32_t>(height),
+  };
+  const size_t valueCount = static_cast<size_t>(width) * height * 4;
+  image.rgbaHalf.resize(valueCount);
+  for (size_t i = 0; i < valueCount; i += 2) {
+    const uint32_t packed = glm::packHalf2x16({pixels[i], pixels[i + 1]});
+    image.rgbaHalf[i] = static_cast<uint16_t>(packed);
+    image.rgbaHalf[i + 1] = static_cast<uint16_t>(packed >> 16);
+  }
+  stbi_image_free(pixels);
+  return image;
+}
+
 GltfModel Resources::loadGltfModel(const std::filesystem::path &path) const {
   const tinygltf::Model model = loadGltf(_baseDir / path);
   return GltfConverter(model).convert();

@@ -66,6 +66,9 @@ void App::initScene() {
     _objects.push_back(object);
   }
 
+  _renderer->setEnvironment(
+      _resources.loadHdrImage("assets/photo_studio_loft_hall_2k.hdr"));
+
   _camera.lookAt(glm::vec3{0.0f, 0.5f, 5.0f}, glm::vec3{0.0f});
   _renderer->setObjects(_objects);
 }

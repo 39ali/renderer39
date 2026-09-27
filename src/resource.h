@@ -17,6 +17,14 @@ struct TextureData {
   std::vector<uint8_t> rgba;
 };
 
+// equirectangular HDR environment
+struct HdrImage {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  // tightly packed RGBA16F
+  std::vector<uint16_t> rgbaHalf;
+};
+
 // one glTF file flattened into a single mesh; node transforms are baked in.
 struct GltfModel {
   std::vector<VertexPosition> positions;
@@ -41,6 +49,7 @@ public:
 
   std::vector<char> readBinary(const std::filesystem::path &path) const;
   GltfModel loadGltfModel(const std::filesystem::path &path) const;
+  HdrImage loadHdrImage(const std::filesystem::path &path) const;
 
 private:
   std::filesystem::path _baseDir;

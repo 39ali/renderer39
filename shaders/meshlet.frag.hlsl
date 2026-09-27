@@ -1,30 +1,25 @@
 #include "brdf.hlsli"
-#include "scene_bindings.hlsli"
+#include "environment.hlsli"
+#include "tonemap.hlsli"
 
 static const float3 kLightColor = float3(1.0, 0.96, 0.9);
-// stand-in for indirect light until the path tracer exists
-static const float3 kAmbientColor = float3(0.03, 0.035, 0.045);
 
 float4 sampleTexture(uint textureIndex, float2 uv, float4 fallback) {
   if (textureIndex == kInvalidTexture) {
     return fallback;
   }
-  return textures[NonUniformResourceIndex(textureIndex)].Sample(
-      materialSampler, uv);
+  return textures[NonUniformResourceIndex(textureIndex)].Sample(materialSampler,
+                                                                uv);
 }
 
-// Stephen Hill's fitted ACES approximation
-float3 tonemapAces(float3 color) {
-  const float3x3 inputMatrix = float3x3(0.59719, 0.35458, 0.04823,
-                                        0.07600, 0.90834, 0.01566,
-                                        0.02840, 0.13383, 0.83777);
-  const float3x3 outputMatrix = float3x3(1.60475, -0.53108, -0.07367,
-                                         -0.10208, 1.10813, -0.00605,
-                                         -0.00327, -0.07276, 1.07602);
-  color = mul(inputMatrix, color);
-  float3 a = color * (color + 0.0245786) - 0.000090537;
-  float3 b = color * (0.983729 * color + 0.4329510) + 0.238081;
-  return saturate(mul(outputMatrix, a / b));
+// Karis' analytic fit of the split-sum environment BRDF (no lookup table)
+float3 environmentBrdfApprox(float3 f0, float roughness, float nDotV) {
+  const float4 c0 = float4(-1.0, -0.0275, -0.572, 0.022);
+  const float4 c1 = float4(1.0, 0.0425, 1.04, -0.04);
+  float4 r = roughness * c0 + c1;
+  float a004 = min(r.x * r.x, exp2(-9.28 * nDotV)) * r.x + r.y;
+  float2 ab = float2(-1.04, 1.04) * a004 + r.zw;
+  return f0 * ab.x + ab.y;
 }
 
 float4 main(VertexOutput input) : SV_Target0 {
@@ -54,14 +49,14 @@ float4 main(VertexOutput input) : SV_Target0 {
     const float3 tangent =
         normalize(input.tangent.xyz - normal * dot(normal, input.tangent.xyz));
     const float3 bitangent = cross(normal, tangent) * input.tangent.w;
-    normal = normalize(tangent * tangentNormal.x +
-                       bitangent * tangentNormal.y + normal * tangentNormal.z);
+    normal = normalize(tangent * tangentNormal.x + bitangent * tangentNormal.y +
+                       normal * tangentNormal.z);
   }
 
   const float occlusion =
-      1.0 + material.occlusionStrength *
-                (sampleTexture(material.occlusionTexture, input.uv, 1.0).r -
-                 1.0);
+      1.0 +
+      material.occlusionStrength *
+          (sampleTexture(material.occlusionTexture, input.uv, 1.0).r - 1.0);
   const float3 emissive =
       material.emissiveFactor *
       sampleTexture(material.emissiveTexture, input.uv, 1.0).rgb;
@@ -88,9 +83,21 @@ float4 main(VertexOutput input) : SV_Target0 {
 
   const float3 v = normalize(pc.cameraPosition.xyz - input.worldPosition);
   const float3 l = -normalize(pc.lightDirection.xyz);
-  float3 color = evaluateBrdf(surface, normal, v, l) * kLightColor *
-                 pc.lightDirection.w;
-  color += kAmbientColor * surface.baseColor * occlusion;
+  float3 color =
+      evaluateBrdf(surface, normal, v, l) * kLightColor * pc.lightDirection.w;
+
+  // Cheap stand-in for image-based lighting: blurry mip lookups instead of
+  // prefiltered maps, and no shadowing.
+  const float blurMip = max(pc.environmentMaxMip - 2.0, 0.0);
+  const float3 diffuseLight = sampleEnvironment(normal, blurMip);
+  const float3 specularLight =
+      sampleEnvironment(reflect(-v, normal), surface.roughness * blurMip);
+  const float3 f0 = lerp(0.04, surface.baseColor, surface.metallic);
+  const float3 specularWeight =
+      environmentBrdfApprox(f0, surface.roughness, saturate(dot(normal, v)));
+  color += (diffuseLight * surface.baseColor * (1.0 - surface.metallic) +
+            specularLight * specularWeight) *
+           occlusion;
   color += emissive;
   return float4(tonemapAces(color), 1.0);
 }

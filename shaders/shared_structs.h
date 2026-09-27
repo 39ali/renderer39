@@ -130,6 +130,11 @@ struct DrawPushConstants {
   vec4 cameraPosition;
   // xyz: direction the light travels, w: intensity
   vec4 lightDirection;
+  // equirectangular HDR in the bindless array, or kInvalidTexture
+  uint environmentTexture;
+  float environmentIntensity;
+  float environmentMaxMip;
+  uint padding2;
 };
 
 SHARED_INLINE uint meshletVertexCount(
@@ -219,7 +224,8 @@ static_assert(offsetof(Material, alphaMode) == 68);
 static_assert(sizeof(MeshletInstance) == 8);
 static_assert(sizeof(RenderCounters) == 8);
 
-static_assert(sizeof(DrawPushConstants) == 192);
+static_assert(sizeof(DrawPushConstants) == 208);
+static_assert(offsetof(DrawPushConstants, environmentTexture) == 192);
 static_assert(offsetof(DrawPushConstants, view) == 64);
 static_assert(offsetof(DrawPushConstants, frustum) == 128);
 static_assert(offsetof(DrawPushConstants, zNearFar) == 144);

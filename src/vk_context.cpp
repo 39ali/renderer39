@@ -749,8 +749,9 @@ void VkContext::copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer,
 }
 
 Texture VkContext::createTexture(uint32_t width, uint32_t height,
-                                 VkFormat format, const void *pixels) {
-  const VkDeviceSize size = VkDeviceSize{width} * height * 4;
+                                 VkFormat format, const void *pixels,
+                                 uint32_t bytesPerPixel) {
+  const VkDeviceSize size = VkDeviceSize{width} * height * bytesPerPixel;
   Buffer<uint8_t> staging;
   createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |

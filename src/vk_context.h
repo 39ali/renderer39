@@ -61,9 +61,9 @@ public:
   // records into a one-off command buffer and waits for it to finish.
   void immediateSubmit(
       const std::function<void(VkCommandBuffer)> &record) const;
-  // uploads tightly packed RGBA8 pixels and generates the full mip chain.
+  // uploads tightly packed pixels and generates the full mip chain.
   Texture createTexture(uint32_t width, uint32_t height, VkFormat format,
-                        const void *pixels);
+                        const void *pixels, uint32_t bytesPerPixel = 4);
   void destroyTexture(Texture &texture) const;
   void waitIdle() const;
   template <typename T>

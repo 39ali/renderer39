@@ -39,6 +39,7 @@ public:
   void init();
   MeshId loadModel(const GltfModel &model);
   void setObjects(const std::vector<Object3D> &objects);
+  void setEnvironment(const HdrImage &image);
   void render(const glm::mat4 &viewProjection, const CameraCullData &cullData,
               float dt);
   void waitIdle();
@@ -95,6 +96,7 @@ private:
   VkDescriptorSetLayout _descriptorSetLayout = VK_NULL_HANDLE;
   VkPipelineLayout _pipelineLayout = VK_NULL_HANDLE;
   VkPipeline _graphicsPipeline = VK_NULL_HANDLE;
+  VkPipeline _skyPipeline = VK_NULL_HANDLE;
   VkDescriptorPool _descriptorPool = VK_NULL_HANDLE;
   VkDescriptorPool _imguiDescriptorPool = VK_NULL_HANDLE;
   VkDescriptorSet _descriptorSet = VK_NULL_HANDLE;
@@ -114,4 +116,7 @@ private:
   float _lightAzimuth = 45.0f;
   float _lightElevation = 50.0f;
   float _lightIntensity = 3.0f;
+  uint32_t _environmentTexture = kInvalidTexture;
+  float _environmentMaxMip = 0.0f;
+  float _environmentIntensity = 1.0f;
 };

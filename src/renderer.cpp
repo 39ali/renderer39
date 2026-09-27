@@ -100,6 +100,7 @@ void Renderer::cleanup() {
       _vkContext.destroyTexture(texture);
     }
     vkDestroySampler(_vkContext.device(), _materialSampler, nullptr);
+    vkDestroyPipeline(_vkContext.device(), _skyPipeline, nullptr);
     vkDestroyPipeline(_vkContext.device(), _graphicsPipeline, nullptr);
     vkDestroyPipelineLayout(_vkContext.device(), _pipelineLayout, nullptr);
     vkDestroyDescriptorPool(_vkContext.device(), _descriptorPool, nullptr);
@@ -279,6 +280,53 @@ void Renderer::createGraphicsPipeline() {
                                 &pipelineInfo, nullptr, &_graphicsPipeline);
   assert(createGraphicsPipelineResult == VK_SUCCESS &&
          "failed to create graphics pipeline");
+
+  // the sky: a fullscreen triangle at the far plane drawn after the meshes
+  const VkShaderModule skyVertShaderModule = _vkContext.createShaderModule(
+      _resources.readBinary("shaders/sky.vert.spv"));
+  const VkShaderModule skyFragShaderModule = _vkContext.createShaderModule(
+      _resources.readBinary("shaders/sky.frag.spv"));
+  const std::array<VkPipelineShaderStageCreateInfo, 2> skyStages{{
+      {
+          .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_VERTEX_BIT,
+          .module = skyVertShaderModule,
+          .pName = "main",
+      },
+      {
+          .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+          .module = skyFragShaderModule,
+          .pName = "main",
+      },
+  }};
+  VkPipelineVertexInputStateCreateInfo skyVertexInput{
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+  };
+  VkPipelineInputAssemblyStateCreateInfo skyInputAssembly{
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+      .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+  };
+  VkPipelineRasterizationStateCreateInfo skyRasterizer = rasterizer;
+  skyRasterizer.cullMode = VK_CULL_MODE_NONE;
+  VkPipelineDepthStencilStateCreateInfo skyDepthStencil = depthStencil;
+  skyDepthStencil.depthWriteEnable = VK_FALSE;
+  skyDepthStencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+  VkGraphicsPipelineCreateInfo skyPipelineInfo = pipelineInfo;
+  skyPipelineInfo.stageCount = static_cast<uint32_t>(skyStages.size());
+  skyPipelineInfo.pStages = skyStages.data();
+  skyPipelineInfo.pVertexInputState = &skyVertexInput;
+  skyPipelineInfo.pInputAssemblyState = &skyInputAssembly;
+  skyPipelineInfo.pRasterizationState = &skyRasterizer;
+  skyPipelineInfo.pDepthStencilState = &skyDepthStencil;
+  const VkResult createSkyPipelineResult =
+      vkCreateGraphicsPipelines(_vkContext.device(), VK_NULL_HANDLE, 1,
+                                &skyPipelineInfo, nullptr, &_skyPipeline);
+  assert(createSkyPipelineResult == VK_SUCCESS &&
+         "failed to create sky pipeline");
+  vkDestroyShaderModule(_vkContext.device(), skyFragShaderModule, nullptr);
+  vkDestroyShaderModule(_vkContext.device(), skyVertShaderModule, nullptr);
 
   vkDestroyShaderModule(_vkContext.device(), fragShaderModule, nullptr);
   vkDestroyShaderModule(_vkContext.device(), meshShaderModule, nullptr);
@@ -590,6 +638,25 @@ void Renderer::uploadTextures(const std::vector<TextureData> &textures) {
   }
 }
 
+void Renderer::setEnvironment(const HdrImage &image) {
+  assert(_environmentTexture == kInvalidTexture &&
+         "replacing the environment is not supported yet");
+  assert(_textures.size() < kMaxTextures);
+  _vkContext.waitIdle();
+  _environmentTexture = static_cast<uint32_t>(_textures.size());
+  _textures.push_back(_vkContext.createTexture(
+      image.width, image.height, VK_FORMAT_R16G16B16A16_SFLOAT,
+      image.rgbaHalf.data(), 4 * sizeof(uint16_t)));
+  _environmentMaxMip =
+      std::floor(std::log2(static_cast<float>(std::max(image.width,
+                                                       image.height))));
+  // materials may not be loaded yet, so the texture array is written with
+  // the rest of the mesh descriptors.
+  if (!_materials.empty()) {
+    updateMeshDescriptorSet();
+  }
+}
+
 void Renderer::rebuildMeshBuffers() {
   _vkContext.waitIdle();
   uploadDeviceLocalBuffer(_meshlets, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
@@ -856,6 +923,8 @@ void Renderer::renderImgui(VkCommandBuffer commandBuffer, float dt) {
   ImGui::SliderFloat("light elevation", &_lightElevation, -10.0f, 90.0f);
   ImGui::SetNextItemWidth(160.0f);
   ImGui::SliderFloat("light intensity", &_lightIntensity, 0.0f, 10.0f);
+  ImGui::SetNextItemWidth(160.0f);
+  ImGui::SliderFloat("environment", &_environmentIntensity, 0.0f, 4.0f);
 
   ImGui::End();
 
@@ -959,6 +1028,9 @@ void Renderer::recordRenderingCommands(VkCommandBuffer commandBuffer,
         .cameraPosition = glm::vec4(glm::vec3(glm::inverse(cullData.view)[3]),
                                     1.0f),
         .lightDirection = glm::vec4(-towardsLight, _lightIntensity),
+        .environmentTexture = _environmentTexture,
+        .environmentIntensity = _environmentIntensity,
+        .environmentMaxMip = _environmentMaxMip,
     };
     vkCmdPushConstants(commandBuffer, _pipelineLayout, kDrawStages, 0,
                        sizeof(DrawPushConstants), &pushConstants);
@@ -968,6 +1040,11 @@ void Renderer::recordRenderingCommands(VkCommandBuffer commandBuffer,
     _vkContext.cmdDrawMeshTasks(
         commandBuffer, minValue(groupCount, kTaskGroupsPerRow),
         (groupCount + kTaskGroupsPerRow - 1) / kTaskGroupsPerRow, 1);
+
+    // same layout, descriptors and push constants as the mesh draw
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      _skyPipeline);
+    vkCmdDraw(commandBuffer, 3, 1, 0, 0);
   }
 
   renderImgui(commandBuffer, dt);

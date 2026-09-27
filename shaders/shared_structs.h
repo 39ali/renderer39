@@ -12,6 +12,9 @@ using vec2 = glm::vec2;
 using vec4 = glm::vec4;
 #define SHARED_INLINE inline
 #else
+// HLSL
+typedef float2 vec2;
+typedef float4 vec4;
 #define SHARED_INLINE
 #endif
 
@@ -70,13 +73,17 @@ SHARED_INLINE uint meshletTriangleCount(
 }
 
 #ifndef __cplusplus
-const uint kMaxMeshletTriangles = 124u;
-const uint kSyntheticIndicesPerMeshlet = kMaxMeshletTriangles * 3u;
+static const uint kMaxMeshletTriangles = 124u;
+static const uint kSyntheticIndicesPerMeshlet = kMaxMeshletTriangles * 3u;
 
-vec4 unpackMeshletSphere(Meshlet meshlet) {
-  vec2 centerXY = unpackHalf2x16(meshlet.packedSphere0);
-  vec2 centerZRadius = unpackHalf2x16(meshlet.packedSphere1);
-  return vec4(centerXY, centerZRadius);
+float2 unpackHalf2x16(uint packed) {
+  return float2(f16tof32(packed), f16tof32(packed >> 16u));
+}
+
+float4 unpackMeshletSphere(Meshlet meshlet) {
+  float2 centerXY = unpackHalf2x16(meshlet.packedSphere0);
+  float2 centerZRadius = unpackHalf2x16(meshlet.packedSphere1);
+  return float4(centerXY, centerZRadius);
 }
 
 float unpackSnorm8(uint value) {
@@ -87,12 +94,12 @@ float unpackSnorm8(uint value) {
   return clamp(float(signedValue) / 127.0, -1.0, 1.0);
 }
 
-vec4 unpackSnorm4x8(uint packed) {
-  return vec4(unpackSnorm8(packed), unpackSnorm8(packed >> 8u),
-              unpackSnorm8(packed >> 16u), unpackSnorm8(packed >> 24u));
+float4 unpackSnorm4x8(uint packed) {
+  return float4(unpackSnorm8(packed), unpackSnorm8(packed >> 8u),
+                unpackSnorm8(packed >> 16u), unpackSnorm8(packed >> 24u));
 }
 
-vec3 rotateByQuat(vec3 v, vec4 q) {
+float3 rotateByQuat(float3 v, float4 q) {
   return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
 }
 #endif

@@ -70,15 +70,17 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(vma)
 
-find_program(GLSLC_EXECUTABLE glslc HINTS "$ENV{VULKAN_SDK}/Bin")
-if (NOT GLSLC_EXECUTABLE)
-  message(FATAL_ERROR "Could not find glslc. Install the Vulkan SDK or add glslc to PATH.")
+find_program(DXC_EXECUTABLE dxc HINTS "$ENV{VULKAN_SDK}/Bin" NO_DEFAULT_PATH)
+find_program(DXC_EXECUTABLE dxc)
+if (NOT DXC_EXECUTABLE)
+  message(FATAL_ERROR "Could not find dxc. Install the Vulkan SDK or add dxc to PATH.")
 endif()
 
+# <name>.<stage>.hlsl compiles to <name>.<stage>.spv
 set(SHADER_SOURCES
-  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gltf.vert
-  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gltf.frag
-  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/meshlet_cull.comp
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gltf.vert.hlsl
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gltf.frag.hlsl
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/meshlet_cull.comp.hlsl
 )
 
 set(SHADER_INCLUDES
@@ -89,12 +91,24 @@ set(SPIRV_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${SPIRV_BINARY_DIR})
 
 foreach(shader ${SHADER_SOURCES})
-  get_filename_component(shader_name ${shader} NAME)
+  get_filename_component(shader_name ${shader} NAME_WLE)
+  get_filename_component(shader_stage ${shader_name} LAST_EXT)
+  if (shader_stage STREQUAL ".vert")
+    set(shader_profile vs_6_6)
+  elseif (shader_stage STREQUAL ".frag")
+    set(shader_profile ps_6_6)
+  elseif (shader_stage STREQUAL ".comp")
+    set(shader_profile cs_6_6)
+  else()
+    message(FATAL_ERROR "Unknown shader stage for ${shader}")
+  endif()
   set(spirv ${SPIRV_BINARY_DIR}/${shader_name}.spv)
   add_custom_command(
     OUTPUT ${spirv}
-    COMMAND ${GLSLC_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/shaders
-            ${shader} -o ${spirv}
+    COMMAND ${DXC_EXECUTABLE} -spirv -fspv-target-env=vulkan1.3
+            -T ${shader_profile} -E main -HV 2021
+            -I ${CMAKE_CURRENT_SOURCE_DIR}/shaders
+            ${shader} -Fo ${spirv}
     DEPENDS ${shader} ${SHADER_INCLUDES}
     VERBATIM
   )

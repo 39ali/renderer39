@@ -12,16 +12,30 @@
 #include <glm/gtc/type_ptr.hpp>
 #include <glm/packing.hpp>
 
+#include <cassert>
+#include <fstream>
 #include <iostream>
+#include <map>
 
-struct Vertex {
-  glm::vec3 position{};
-  glm::vec3 normal{0.0f, 0.0f, 1.0f};
+namespace {
+
+// one glTF primitive after node transforms are applied
+struct PrimitiveGeometry {
+  std::vector<glm::vec3> positions;
+  std::vector<glm::vec3> normals;
+  std::vector<glm::vec4> tangents;
+  std::vector<glm::vec2> uvs;
+  std::vector<uint32_t> indices;
+  uint32_t materialIndex = 0;
 };
 
-struct CpuGeometry {
-  std::vector<Vertex> vertices;
-  std::vector<uint32_t> indices;
+struct AccessorView {
+  const uint8_t *data = nullptr;
+  size_t stride = 0;
+  size_t count = 0;
+  int componentType = 0;
+  int componentCount = 0;
+  bool normalized = false;
 };
 
 uint32_t packCountsAndFlags(uint32_t vertexCount, uint32_t triangleCount,
@@ -45,39 +59,116 @@ uint32_t packTriangle(uint8_t a, uint8_t b, uint8_t c) {
          (static_cast<uint32_t>(c) << 20);
 }
 
-MeshletVertex packClusterVertex(const Vertex &vertex) {
-  const glm::vec3 normal = glm::normalize(vertex.normal);
+glm::vec2 octEncode(glm::vec3 n) {
+  n /= std::abs(n.x) + std::abs(n.y) + std::abs(n.z);
+  if (n.z < 0.0f) {
+    const glm::vec2 signs{n.x >= 0.0f ? 1.0f : -1.0f,
+                          n.y >= 0.0f ? 1.0f : -1.0f};
+    return (1.0f - glm::abs(glm::vec2{n.y, n.x})) * signs;
+  }
+  return {n.x, n.y};
+}
 
+VertexAttributes packAttributes(const glm::vec3 &normal,
+                                const glm::vec4 &tangent, const glm::vec2 &uv) {
+  uint32_t packedTangent = glm::packSnorm2x16(octEncode(glm::vec3(tangent)));
+  packedTangent = (packedTangent & ~1u) | (tangent.w < 0.0f ? 1u : 0u);
   return {
-      .positionXY = glm::packHalf2x16({vertex.position.x, vertex.position.y}),
-      .positionZNormalX = glm::packHalf2x16({vertex.position.z, normal.x}),
-      .normalYZ = glm::packHalf2x16({normal.y, normal.z}),
+      .uv = uv,
+      .normal = glm::packSnorm2x16(octEncode(normal)),
+      .tangent = packedTangent,
   };
 }
 
-template <typename T>
-const T *accessorData(const tinygltf::Model &model,
-                      const tinygltf::Accessor &accessor) {
+AccessorView accessorView(const tinygltf::Model &model, int accessorIndex) {
+  const auto &accessor = model.accessors[accessorIndex];
+  assert(accessor.bufferView >= 0 && "sparse glTF accessors are unsupported");
   const auto &view = model.bufferViews[accessor.bufferView];
   const auto &buffer = model.buffers[view.buffer];
-  return reinterpret_cast<const T *>(buffer.data.data() + view.byteOffset +
-                                     accessor.byteOffset);
+  const int componentSize =
+      tinygltf::GetComponentSizeInBytes(accessor.componentType);
+  const int componentCount = tinygltf::GetNumComponentsInType(accessor.type);
+  const int byteStride = accessor.ByteStride(view);
+  return {
+      .data = buffer.data.data() + view.byteOffset + accessor.byteOffset,
+      .stride = byteStride > 0
+                    ? static_cast<size_t>(byteStride)
+                    : static_cast<size_t>(componentSize * componentCount),
+      .count = accessor.count,
+      .componentType = accessor.componentType,
+      .componentCount = componentCount,
+      .normalized = accessor.normalized,
+  };
 }
 
-size_t accessorStride(const tinygltf::Model &model,
-                      const tinygltf::Accessor &accessor) {
-  const auto &view = model.bufferViews[accessor.bufferView];
-  return accessor.ByteStride(view) > 0
-             ? static_cast<size_t>(accessor.ByteStride(view))
-             : tinygltf::GetComponentSizeInBytes(accessor.componentType) *
-                   tinygltf::GetNumComponentsInType(accessor.type);
+AccessorView findAttribute(const tinygltf::Model &model,
+                           const tinygltf::Primitive &primitive,
+                           const char *name) {
+  const auto it = primitive.attributes.find(name);
+  return it == primitive.attributes.end() ? AccessorView{}
+                                          : accessorView(model, it->second);
+}
+
+float readComponent(const uint8_t *value, int componentType, bool normalized) {
+  switch (componentType) {
+  case TINYGLTF_COMPONENT_TYPE_FLOAT:
+    return *reinterpret_cast<const float *>(value);
+  case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE: {
+    const float v = *value;
+    return normalized ? v / 255.0f : v;
+  }
+  case TINYGLTF_COMPONENT_TYPE_BYTE: {
+    const float v = *reinterpret_cast<const int8_t *>(value);
+    return normalized ? std::max(v / 127.0f, -1.0f) : v;
+  }
+  case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT: {
+    const float v = *reinterpret_cast<const uint16_t *>(value);
+    return normalized ? v / 65535.0f : v;
+  }
+  case TINYGLTF_COMPONENT_TYPE_SHORT: {
+    const float v = *reinterpret_cast<const int16_t *>(value);
+    return normalized ? std::max(v / 32767.0f, -1.0f) : v;
+  }
+  case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT:
+    return static_cast<float>(*reinterpret_cast<const uint32_t *>(value));
+  default:
+    assert(false && "unsupported glTF component type");
+    return 0.0f;
+  }
+}
+
+// reads element i as a vec4; missing components are 0 (w defaults to 1).
+glm::vec4 readVec(const AccessorView &view, size_t i) {
+  glm::vec4 result{0.0f, 0.0f, 0.0f, 1.0f};
+  const uint8_t *element = view.data + i * view.stride;
+  const int componentSize = tinygltf::GetComponentSizeInBytes(view.componentType);
+  for (int c = 0; c < view.componentCount && c < 4; ++c) {
+    result[c] = readComponent(element + c * componentSize, view.componentType,
+                              view.normalized);
+  }
+  return result;
+}
+
+uint32_t readIndex(const AccessorView &view, size_t i) {
+  const uint8_t *value = view.data + i * view.stride;
+  switch (view.componentType) {
+  case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
+    return *value;
+  case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
+    return *reinterpret_cast<const uint16_t *>(value);
+  case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT:
+    return *reinterpret_cast<const uint32_t *>(value);
+  default:
+    assert(false && "unsupported glTF index component type");
+    return 0;
+  }
 }
 
 glm::mat4 nodeMatrix(const tinygltf::Node &node) {
-  glm::mat4 matrix(1.0f);
   if (node.matrix.size() == 16) {
-    matrix = glm::make_mat4x4(node.matrix.data());
+    return glm::mat4(glm::make_mat4x4(node.matrix.data()));
   }
+  glm::mat4 matrix(1.0f);
   if (node.translation.size() == 3) {
     matrix = glm::translate(matrix,
                             glm::vec3(node.translation[0], node.translation[1],
@@ -120,167 +211,372 @@ tinygltf::Model loadGltf(const std::filesystem::path &path) {
   return model;
 }
 
-void loadNode(const tinygltf::Model &model, const tinygltf::Node &node,
-              const glm::mat4 &parentTransform, CpuGeometry &geometry) {
-  const glm::mat4 transform = parentTransform * nodeMatrix(node);
+void generateNormals(PrimitiveGeometry &primitive) {
+  primitive.normals.assign(primitive.positions.size(), glm::vec3(0.0f));
+  for (size_t i = 0; i + 2 < primitive.indices.size(); i += 3) {
+    const uint32_t a = primitive.indices[i];
+    const uint32_t b = primitive.indices[i + 1];
+    const uint32_t c = primitive.indices[i + 2];
+    // area weighted
+    const glm::vec3 faceNormal =
+        glm::cross(primitive.positions[b] - primitive.positions[a],
+                   primitive.positions[c] - primitive.positions[a]);
+    primitive.normals[a] += faceNormal;
+    primitive.normals[b] += faceNormal;
+    primitive.normals[c] += faceNormal;
+  }
+  for (glm::vec3 &normal : primitive.normals) {
+    const float length = glm::length(normal);
+    normal = length > 0.0f ? normal / length : glm::vec3(0.0f, 0.0f, 1.0f);
+  }
+}
 
-  if (node.mesh >= 0) {
-    const auto &mesh = model.meshes[node.mesh];
-    for (const auto &primitive : mesh.primitives) {
-      if (primitive.mode != TINYGLTF_MODE_TRIANGLES) {
+glm::vec3 anyPerpendicular(const glm::vec3 &n) {
+  const glm::vec3 axis = std::abs(n.x) < 0.9f ? glm::vec3(1.0f, 0.0f, 0.0f)
+                                              : glm::vec3(0.0f, 1.0f, 0.0f);
+  return glm::normalize(glm::cross(axis, n));
+}
+
+// per-vertex tangents accumulated from triangle UV gradients. Not MikkTSpace,
+// so baked normal maps may show small seams; assets that ship tangents use
+// those instead.
+void generateTangents(PrimitiveGeometry &primitive) {
+  const size_t vertexCount = primitive.positions.size();
+  std::vector<glm::vec3> tangents(vertexCount, glm::vec3(0.0f));
+  std::vector<glm::vec3> bitangents(vertexCount, glm::vec3(0.0f));
+
+  if (!primitive.uvs.empty()) {
+    for (size_t i = 0; i + 2 < primitive.indices.size(); i += 3) {
+      const uint32_t v[3] = {primitive.indices[i], primitive.indices[i + 1],
+                             primitive.indices[i + 2]};
+      const glm::vec3 e1 =
+          primitive.positions[v[1]] - primitive.positions[v[0]];
+      const glm::vec3 e2 =
+          primitive.positions[v[2]] - primitive.positions[v[0]];
+      const glm::vec2 d1 = primitive.uvs[v[1]] - primitive.uvs[v[0]];
+      const glm::vec2 d2 = primitive.uvs[v[2]] - primitive.uvs[v[0]];
+      const float determinant = d1.x * d2.y - d2.x * d1.y;
+      if (std::abs(determinant) < 1e-12f) {
         continue;
       }
-
-      const auto positionIt = primitive.attributes.find("POSITION");
-      if (positionIt == primitive.attributes.end()) {
-        continue;
-      }
-
-      const auto &positionAccessor = model.accessors[positionIt->second];
-      const auto *positions = accessorData<uint8_t>(model, positionAccessor);
-      const size_t positionStride = accessorStride(model, positionAccessor);
-
-      const uint8_t *normals = nullptr;
-      size_t normalStride = 0;
-      if (const auto it = primitive.attributes.find("NORMAL");
-          it != primitive.attributes.end()) {
-        const auto &accessor = model.accessors[it->second];
-        normals = accessorData<uint8_t>(model, accessor);
-        normalStride = accessorStride(model, accessor);
-      }
-
-      const uint32_t firstVertex =
-          static_cast<uint32_t>(geometry.vertices.size());
-      for (size_t i = 0; i < positionAccessor.count; ++i) {
-        const auto *p =
-            reinterpret_cast<const float *>(positions + i * positionStride);
-        Vertex vertex{
-            .position =
-                glm::vec3(transform * glm::vec4(p[0], p[1], p[2], 1.0f)),
-        };
-        if (normals) {
-          const auto *n =
-              reinterpret_cast<const float *>(normals + i * normalStride);
-          vertex.normal = glm::normalize(glm::mat3(transform) *
-                                         glm::vec3(n[0], n[1], n[2]));
-        }
-        geometry.vertices.push_back(vertex);
-      }
-
-      if (primitive.indices >= 0) {
-        const auto &accessor = model.accessors[primitive.indices];
-        const auto *indexBytes = accessorData<uint8_t>(model, accessor);
-        const size_t stride = accessorStride(model, accessor);
-        for (size_t i = 0; i < accessor.count; ++i) {
-          uint32_t index = 0;
-          const auto *value = indexBytes + i * stride;
-          switch (accessor.componentType) {
-          case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
-            index = *reinterpret_cast<const uint8_t *>(value);
-            break;
-          case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
-            index = *reinterpret_cast<const uint16_t *>(value);
-            break;
-          case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT:
-            index = *reinterpret_cast<const uint32_t *>(value);
-            break;
-          default:
-            assert(false && "unsupported glTF index component type");
-            break;
-          }
-          geometry.indices.push_back(firstVertex + index);
-        }
-      } else {
-        for (size_t i = 0; i < positionAccessor.count; ++i) {
-          geometry.indices.push_back(firstVertex + static_cast<uint32_t>(i));
-        }
+      const float r = 1.0f / determinant;
+      const glm::vec3 tangent = (e1 * d2.y - e2 * d1.y) * r;
+      const glm::vec3 bitangent = (e2 * d1.x - e1 * d2.x) * r;
+      for (const uint32_t vertex : v) {
+        tangents[vertex] += tangent;
+        bitangents[vertex] += bitangent;
       }
     }
   }
 
-  for (const int childIndex : node.children) {
-    loadNode(model, model.nodes[childIndex], transform, geometry);
+  primitive.tangents.resize(vertexCount);
+  for (size_t i = 0; i < vertexCount; ++i) {
+    const glm::vec3 &n = primitive.normals[i];
+    glm::vec3 t = tangents[i] - n * glm::dot(n, tangents[i]);
+    const float length = glm::length(t);
+    t = length > 1e-8f ? t / length : anyPerpendicular(n);
+    const float sign =
+        glm::dot(glm::cross(n, t), bitangents[i]) < 0.0f ? -1.0f : 1.0f;
+    primitive.tangents[i] = glm::vec4(t, sign);
   }
 }
 
-CpuGeometry flattenGeometry(const tinygltf::Model &model) {
-  CpuGeometry geometry;
-  const int sceneIndex = model.defaultScene >= 0 ? model.defaultScene : 0;
-  for (const int nodeIndex : model.scenes[sceneIndex].nodes) {
-    loadNode(model, model.nodes[nodeIndex], glm::mat4(1.0f), geometry);
+PrimitiveGeometry loadPrimitive(const tinygltf::Model &model,
+                                const tinygltf::Primitive &primitive,
+                                const glm::mat4 &transform,
+                                uint32_t materialIndex) {
+  PrimitiveGeometry geometry{.materialIndex = materialIndex};
+
+  const AccessorView positions = findAttribute(model, primitive, "POSITION");
+  const AccessorView normals = findAttribute(model, primitive, "NORMAL");
+  const AccessorView tangents = findAttribute(model, primitive, "TANGENT");
+  const AccessorView uvs = findAttribute(model, primitive, "TEXCOORD_0");
+
+  const glm::mat3 linear(transform);
+  const glm::mat3 normalMatrix = glm::transpose(glm::inverse(linear));
+
+  geometry.positions.reserve(positions.count);
+  for (size_t i = 0; i < positions.count; ++i) {
+    geometry.positions.push_back(
+        glm::vec3(transform * glm::vec4(glm::vec3(readVec(positions, i)), 1.0f)));
+  }
+  if (normals.data) {
+    for (size_t i = 0; i < normals.count; ++i) {
+      geometry.normals.push_back(
+          glm::normalize(normalMatrix * glm::vec3(readVec(normals, i))));
+    }
+  }
+  if (tangents.data) {
+    for (size_t i = 0; i < tangents.count; ++i) {
+      const glm::vec4 tangent = readVec(tangents, i);
+      geometry.tangents.push_back(glm::vec4(
+          glm::normalize(linear * glm::vec3(tangent)), tangent.w));
+    }
+  }
+  if (uvs.data) {
+    for (size_t i = 0; i < uvs.count; ++i) {
+      geometry.uvs.push_back(glm::vec2(readVec(uvs, i)));
+    }
   }
 
-  assert(!geometry.vertices.empty() && !geometry.indices.empty() &&
-         "glTF contains no triangle geometry");
+  if (primitive.indices >= 0) {
+    const AccessorView indices = accessorView(model, primitive.indices);
+    geometry.indices.reserve(indices.count);
+    for (size_t i = 0; i < indices.count; ++i) {
+      geometry.indices.push_back(readIndex(indices, i));
+    }
+  } else {
+    for (size_t i = 0; i < positions.count; ++i) {
+      geometry.indices.push_back(static_cast<uint32_t>(i));
+    }
+  }
+
+  // mirrored transforms flip the winding
+  if (glm::determinant(linear) < 0.0f) {
+    for (size_t i = 0; i + 2 < geometry.indices.size(); i += 3) {
+      std::swap(geometry.indices[i + 1], geometry.indices[i + 2]);
+    }
+    for (glm::vec4 &tangent : geometry.tangents) {
+      tangent.w = -tangent.w;
+    }
+  }
+
+  if (geometry.normals.empty()) {
+    generateNormals(geometry);
+  }
+  if (geometry.tangents.empty()) {
+    generateTangents(geometry);
+  }
   return geometry;
 }
 
-GltfModel buildMeshlets(const CpuGeometry &geometry) {
-  constexpr size_t kMaxMeshletVertices = 64;
-  constexpr size_t kMaxMeshletTriangles = 124;
-  constexpr float kConeWeight = 0.0f;
-  GltfModel gltfModel;
-  gltfModel.packedClusterVertices.reserve(geometry.vertices.size());
-  for (const Vertex &vertex : geometry.vertices) {
-    gltfModel.packedClusterVertices.push_back(packClusterVertex(vertex));
+class GltfConverter {
+public:
+  explicit GltfConverter(const tinygltf::Model &model) : _model(model) {}
+
+  GltfModel convert() {
+    for (const auto &material : _model.materials) {
+      _result.materials.push_back(convertMaterial(material));
+    }
+
+    const int sceneIndex = _model.defaultScene >= 0 ? _model.defaultScene : 0;
+    for (const int nodeIndex : _model.scenes[sceneIndex].nodes) {
+      loadNode(_model.nodes[nodeIndex], glm::mat4(1.0f));
+    }
+    assert(!_result.meshlets.empty() && "glTF contains no triangle geometry");
+
+    computeBounds();
+    return std::move(_result);
   }
 
-  const size_t maxMeshlets = meshopt_buildMeshletsBound(
-      geometry.indices.size(), kMaxMeshletVertices, kMaxMeshletTriangles);
+private:
+  void loadNode(const tinygltf::Node &node, const glm::mat4 &parentTransform) {
+    const glm::mat4 transform = parentTransform * nodeMatrix(node);
 
-  std::vector<meshopt_Meshlet> meshlets(maxMeshlets);
-  std::vector<unsigned int> meshletVertices(maxMeshlets * kMaxMeshletVertices);
-  std::vector<unsigned char> meshletTriangles(maxMeshlets *
-                                              kMaxMeshletTriangles * 3);
+    if (node.mesh >= 0) {
+      for (const auto &primitive : _model.meshes[node.mesh].primitives) {
+        if (primitive.mode != TINYGLTF_MODE_TRIANGLES ||
+            primitive.attributes.count("POSITION") == 0) {
+          continue;
+        }
+        appendPrimitive(loadPrimitive(_model, primitive, transform,
+                                      materialIndex(primitive.material)));
+      }
+    }
 
-  const size_t meshletCount = meshopt_buildMeshlets(
-      meshlets.data(), meshletVertices.data(), meshletTriangles.data(),
-      geometry.indices.data(), geometry.indices.size(),
-      reinterpret_cast<const float *>(geometry.vertices.data()),
-      geometry.vertices.size(), sizeof(Vertex), kMaxMeshletVertices,
-      kMaxMeshletTriangles, kConeWeight);
+    for (const int childIndex : node.children) {
+      loadNode(_model.nodes[childIndex], transform);
+    }
+  }
 
-  gltfModel.packedMeshlets.reserve(meshletCount);
-  for (size_t i = 0; i < meshletCount; ++i) {
-    const meshopt_Meshlet &meshlet = meshlets[i];
-    const meshopt_Bounds bounds = meshopt_computeMeshletBounds(
-        &meshletVertices[meshlet.vertex_offset],
-        &meshletTriangles[meshlet.triangle_offset], meshlet.triangle_count,
-        reinterpret_cast<const float *>(geometry.vertices.data()),
-        geometry.vertices.size(), sizeof(Vertex));
+  uint32_t materialIndex(int gltfMaterial) {
+    if (gltfMaterial >= 0) {
+      return static_cast<uint32_t>(gltfMaterial);
+    }
+    if (_defaultMaterial == kInvalidTexture) {
+      _defaultMaterial = static_cast<uint32_t>(_result.materials.size());
+      _result.materials.push_back(convertMaterial(tinygltf::Material{}));
+    }
+    return _defaultMaterial;
+  }
 
-    Meshlet meshletData{
-        .packedSphere0 =
-            glm::packHalf2x16({bounds.center[0], bounds.center[1]}),
-        .packedSphere1 =
-            glm::packHalf2x16({bounds.center[2], bounds.radius}),
-        .vertexOffset =
-            static_cast<uint32_t>(gltfModel.packedMeshletVertexRefs.size()),
-        .triangleOffset =
-            static_cast<uint32_t>(gltfModel.packedClusterTriangles.size()),
-        .packedCountsAndFlags =
-            packCountsAndFlags(static_cast<uint32_t>(meshlet.vertex_count),
-                               static_cast<uint32_t>(meshlet.triangle_count)),
-        .boundingCone = packMeshletCone(bounds),
+  void appendPrimitive(const PrimitiveGeometry &primitive) {
+    const uint32_t vertexBase =
+        static_cast<uint32_t>(_result.positions.size());
+    for (size_t i = 0; i < primitive.positions.size(); ++i) {
+      const glm::vec3 &p = primitive.positions[i];
+      _result.positions.push_back({p.x, p.y, p.z});
+      _result.attributes.push_back(packAttributes(
+          primitive.normals[i], primitive.tangents[i],
+          primitive.uvs.empty() ? glm::vec2(0.0f) : primitive.uvs[i]));
+    }
+    for (const uint32_t index : primitive.indices) {
+      _result.indices.push_back(vertexBase + index);
+    }
+    buildMeshlets(primitive, vertexBase);
+  }
+
+  void buildMeshlets(const PrimitiveGeometry &primitive, uint32_t vertexBase) {
+    constexpr float kConeWeight = 0.0f;
+    const size_t maxMeshlets = meshopt_buildMeshletsBound(
+        primitive.indices.size(), kMaxMeshletVertices, kMaxMeshletTriangles);
+
+    std::vector<meshopt_Meshlet> meshlets(maxMeshlets);
+    std::vector<unsigned int> meshletVertices(maxMeshlets *
+                                              kMaxMeshletVertices);
+    std::vector<unsigned char> meshletTriangles(maxMeshlets *
+                                                kMaxMeshletTriangles * 3);
+
+    const auto *positions =
+        reinterpret_cast<const float *>(primitive.positions.data());
+    const size_t meshletCount = meshopt_buildMeshlets(
+        meshlets.data(), meshletVertices.data(), meshletTriangles.data(),
+        primitive.indices.data(), primitive.indices.size(), positions,
+        primitive.positions.size(), sizeof(glm::vec3), kMaxMeshletVertices,
+        kMaxMeshletTriangles, kConeWeight);
+
+    for (size_t i = 0; i < meshletCount; ++i) {
+      const meshopt_Meshlet &meshlet = meshlets[i];
+      const meshopt_Bounds bounds = meshopt_computeMeshletBounds(
+          &meshletVertices[meshlet.vertex_offset],
+          &meshletTriangles[meshlet.triangle_offset], meshlet.triangle_count,
+          positions, primitive.positions.size(), sizeof(glm::vec3));
+
+      _result.meshlets.push_back({
+          .packedSphere0 =
+              glm::packHalf2x16({bounds.center[0], bounds.center[1]}),
+          .packedSphere1 =
+              glm::packHalf2x16({bounds.center[2], bounds.radius}),
+          .vertexOffset =
+              static_cast<uint32_t>(_result.meshletVertexRefs.size()),
+          .triangleOffset =
+              static_cast<uint32_t>(_result.meshletTriangles.size()),
+          .packedCountsAndFlags = packCountsAndFlags(meshlet.vertex_count,
+                                                     meshlet.triangle_count),
+          .boundingCone = packMeshletCone(bounds),
+          .materialIndex = primitive.materialIndex,
+      });
+
+      for (uint32_t v = 0; v < meshlet.vertex_count; ++v) {
+        _result.meshletVertexRefs.push_back(
+            vertexBase + meshletVertices[meshlet.vertex_offset + v]);
+      }
+      for (uint32_t t = 0; t < meshlet.triangle_count; ++t) {
+        const size_t offset = meshlet.triangle_offset + t * 3;
+        _result.meshletTriangles.push_back(packTriangle(
+            meshletTriangles[offset], meshletTriangles[offset + 1],
+            meshletTriangles[offset + 2]));
+      }
+    }
+  }
+
+  Material convertMaterial(const tinygltf::Material &material) {
+    const auto &pbr = material.pbrMetallicRoughness;
+    Material result{
+        .baseColorFactor = glm::vec4(
+            static_cast<float>(pbr.baseColorFactor[0]),
+            static_cast<float>(pbr.baseColorFactor[1]),
+            static_cast<float>(pbr.baseColorFactor[2]),
+            static_cast<float>(pbr.baseColorFactor[3])),
+        .emissiveFactor =
+            glm::vec3(static_cast<float>(material.emissiveFactor[0]),
+                      static_cast<float>(material.emissiveFactor[1]),
+                      static_cast<float>(material.emissiveFactor[2])),
+        .metallicFactor = static_cast<float>(pbr.metallicFactor),
+        .roughnessFactor = static_cast<float>(pbr.roughnessFactor),
+        .normalScale = static_cast<float>(material.normalTexture.scale),
+        .occlusionStrength =
+            static_cast<float>(material.occlusionTexture.strength),
+        .alphaCutoff = static_cast<float>(material.alphaCutoff),
+        .baseColorTexture = texture(pbr.baseColorTexture.index, true),
+        .metallicRoughnessTexture =
+            texture(pbr.metallicRoughnessTexture.index, false),
+        .normalTexture = texture(material.normalTexture.index, false),
+        .occlusionTexture = texture(material.occlusionTexture.index, false),
+        .emissiveTexture = texture(material.emissiveTexture.index, true),
+        .alphaMode = material.alphaMode == "MASK"    ? kAlphaModeMask
+                     : material.alphaMode == "BLEND" ? kAlphaModeBlend
+                                                     : kAlphaModeOpaque,
     };
 
-    for (uint32_t vertex = 0; vertex < meshlet.vertex_count; ++vertex) {
-      const uint32_t vertexIndex =
-          meshletVertices[meshlet.vertex_offset + vertex];
-      gltfModel.packedMeshletVertexRefs.push_back(vertexIndex);
+    if (const auto it =
+            material.extensions.find("KHR_materials_emissive_strength");
+        it != material.extensions.end() && it->second.Has("emissiveStrength")) {
+      result.emissiveFactor *= static_cast<float>(
+          it->second.Get("emissiveStrength").GetNumberAsDouble());
     }
-    for (uint32_t triangle = 0; triangle < meshlet.triangle_count; ++triangle) {
-      const size_t triangleOffset = meshlet.triangle_offset + triangle * 3;
-      gltfModel.packedClusterTriangles.push_back(
-          packTriangle(meshletTriangles[triangleOffset],
-                       meshletTriangles[triangleOffset + 1],
-                       meshletTriangles[triangleOffset + 2]));
-    }
-    gltfModel.packedMeshlets.push_back(meshletData);
+    return result;
   }
 
-  return gltfModel;
-}
+  // returns the index into _result.textures, decoding each (image, color
+  // space) pair once.
+  uint32_t texture(int gltfTexture, bool srgb) {
+    if (gltfTexture < 0) {
+      return kInvalidTexture;
+    }
+    const int imageIndex = _model.textures[gltfTexture].source;
+    if (imageIndex < 0) {
+      return kInvalidTexture;
+    }
+
+    const auto key = std::make_pair(imageIndex, srgb);
+    if (const auto it = _textureIndices.find(key); it != _textureIndices.end()) {
+      return it->second;
+    }
+
+    const tinygltf::Image &image = _model.images[imageIndex];
+    if (image.image.empty() || image.width <= 0 || image.height <= 0) {
+      std::cerr << "glTF image " << imageIndex << " could not be decoded\n";
+      return kInvalidTexture;
+    }
+
+    TextureData data{
+        .width = static_cast<uint32_t>(image.width),
+        .height = static_cast<uint32_t>(image.height),
+        .srgb = srgb,
+    };
+    const size_t pixelCount = static_cast<size_t>(data.width) * data.height;
+    const size_t bytesPerComponent = image.bits == 16 ? 2 : 1;
+    data.rgba.resize(pixelCount * 4);
+    for (size_t pixel = 0; pixel < pixelCount; ++pixel) {
+      uint8_t rgba[4] = {0, 0, 0, 255};
+      for (int c = 0; c < image.component && c < 4; ++c) {
+        // 16-bit images keep their high byte (little endian)
+        const size_t byte =
+            (pixel * image.component + c) * bytesPerComponent +
+            (bytesPerComponent - 1);
+        rgba[c] = image.image[byte];
+      }
+      if (image.component == 1) {
+        rgba[1] = rgba[2] = rgba[0];
+      }
+      std::memcpy(&data.rgba[pixel * 4], rgba, 4);
+    }
+
+    const uint32_t index = static_cast<uint32_t>(_result.textures.size());
+    _result.textures.push_back(std::move(data));
+    _textureIndices.emplace(key, index);
+    return index;
+  }
+
+  void computeBounds() {
+    glm::vec3 minimum(std::numeric_limits<float>::max());
+    glm::vec3 maximum(-std::numeric_limits<float>::max());
+    for (const VertexPosition &p : _result.positions) {
+      minimum = glm::min(minimum, glm::vec3(p.x, p.y, p.z));
+      maximum = glm::max(maximum, glm::vec3(p.x, p.y, p.z));
+    }
+    _result.boundsCenter = (minimum + maximum) * 0.5f;
+    _result.boundsRadius = glm::length(maximum - minimum) * 0.5f;
+  }
+
+  const tinygltf::Model &_model;
+  GltfModel _result;
+  std::map<std::pair<int, bool>, uint32_t> _textureIndices;
+  uint32_t _defaultMaterial = kInvalidTexture;
+};
+
+} // namespace
 
 Resources::Resources(std::filesystem::path baseDir)
     : _baseDir(std::move(baseDir)) {}
@@ -303,6 +599,6 @@ Resources::readBinary(const std::filesystem::path &path) const {
 }
 
 GltfModel Resources::loadGltfModel(const std::filesystem::path &path) const {
-  const auto resolvedPath = _baseDir / path;
-  return buildMeshlets(flattenGeometry(loadGltf(resolvedPath)));
+  const tinygltf::Model model = loadGltf(_baseDir / path);
+  return GltfConverter(model).convert();
 }

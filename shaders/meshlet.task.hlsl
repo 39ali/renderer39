@@ -1,11 +1,4 @@
-#include "shared_structs.h"
-
-[[vk::push_constant]] DrawPushConstants pc;
-
-[[vk::binding(0, 0)]] StructuredBuffer<InstanceData> instances;
-[[vk::binding(1, 0)]] StructuredBuffer<Meshlet> meshlets;
-[[vk::binding(5, 0)]] StructuredBuffer<MeshletInstance> candidateMeshlets;
-[[vk::binding(6, 0)]] RWStructuredBuffer<RenderCounters> counters;
+#include "scene_bindings.hlsli"
 
 groupshared TaskPayload payload;
 

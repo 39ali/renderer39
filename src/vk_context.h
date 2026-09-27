@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <optional>
 #include <vector>
 #include <vk_mem_alloc.h>
@@ -29,6 +30,12 @@ struct RenderTargetInfo {
   VkExtent2D extent{};
 };
 
+struct Texture {
+  VkImage image = VK_NULL_HANDLE;
+  VmaAllocation allocation = VK_NULL_HANDLE;
+  VkImageView view = VK_NULL_HANDLE;
+};
+
 template <typename T> struct Buffer {
   VkBuffer buffer = VK_NULL_HANDLE;
   VmaAllocation allocation = VK_NULL_HANDLE;
@@ -51,6 +58,13 @@ public:
   VkShaderModule createShaderModule(const std::vector<char> &code) const;
   RenderTargetInfo renderTargetInfo() const;
   void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size);
+  // records into a one-off command buffer and waits for it to finish.
+  void immediateSubmit(
+      const std::function<void(VkCommandBuffer)> &record) const;
+  // uploads tightly packed RGBA8 pixels and generates the full mip chain.
+  Texture createTexture(uint32_t width, uint32_t height, VkFormat format,
+                        const void *pixels);
+  void destroyTexture(Texture &texture) const;
   void waitIdle() const;
   template <typename T>
   void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
@@ -125,7 +139,7 @@ private:
   VkExtent2D
   chooseSwapExtent(const VkSurfaceCapabilitiesKHR &capabilities) const;
   void createImageViews();
-  VkImageView createImageView(VkImage image, VkFormat format,
+  VkImageView createImageView(VkImage image, VkFormat format, uint32_t mipLevels,
                               VkImageAspectFlags aspectFlags) const;
   void createImage(uint32_t width, uint32_t height, VkFormat format,
                    VkImageUsageFlags usage, VkMemoryPropertyFlags properties,

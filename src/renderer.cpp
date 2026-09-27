@@ -10,17 +10,30 @@
 #include <string>
 
 namespace {
-constexpr uint32_t kBindingCount = 7;
-constexpr VkShaderStageFlags kDrawStages =
-    VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT;
+// must match shaders/scene_bindings.hlsli
+enum Binding : uint32_t {
+  kBindingInstances = 0,
+  kBindingMeshlets = 1,
+  kBindingVertexPositions = 2,
+  kBindingVertexAttributes = 3,
+  kBindingMeshletVertexRefs = 4,
+  kBindingMeshletTriangles = 5,
+  kBindingCandidateMeshlets = 6,
+  kBindingCounters = 7,
+  kBindingMaterials = 8,
+  kBindingSampler = 9,
+  kBindingTextures = 10,
+  kBindingCount = 11,
+};
+constexpr uint32_t kStorageBufferBindingCount = 9;
+constexpr VkShaderStageFlags kDrawStages = VK_SHADER_STAGE_TASK_BIT_EXT |
+                                           VK_SHADER_STAGE_MESH_BIT_EXT |
+                                           VK_SHADER_STAGE_FRAGMENT_BIT;
 
-uint32_t packColor(const glm::vec4 &color) {
-  const auto packChannel = [](float value) {
-    return static_cast<uint32_t>(clamp(value, 0.0f, 1.0f) * 255.0f + 0.5f);
-  };
-  return packChannel(color.r) | (packChannel(color.g) << 8) |
-         (packChannel(color.b) << 16) | (packChannel(color.a) << 24);
-}
+const char *const kDebugViewNames[] = {
+    "lit",       "base color", "normal",   "metallic",
+    "roughness", "occlusion",  "emissive", "uv",
+};
 
 std::string formatNumber(uint64_t value) {
   std::string text = std::to_string(value);
@@ -38,7 +51,6 @@ InstanceData makeInstanceData(const Object3D &object) {
       .rotation = {object.rotation.x, object.rotation.y, object.rotation.z,
                    object.rotation.w},
       .scaleYZ = {object.scale.y, object.scale.z},
-      .packedColor = packColor(object.color),
   };
 }
 
@@ -55,6 +67,7 @@ void Renderer::init() {
   createGraphicsPipeline();
   createDescriptorPool();
   createDescriptorSet();
+  createSampler();
   for (Buffer<RenderCounters> &buffer : _renderBucket.counterReadbackBuffers) {
     _vkContext.createBuffer(sizeof(RenderCounters),
                             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -77,10 +90,16 @@ void Renderer::cleanup() {
     _vkContext.destroyBuffer(_renderBucket.counterBuffer);
     _vkContext.destroyBuffer(_renderBucket.candidateMeshletBuffer);
     _vkContext.destroyBuffer(_instanceBuffer);
-    _vkContext.destroyBuffer(_clusterTriangleBuffer);
+    _vkContext.destroyBuffer(_materialBuffer);
+    _vkContext.destroyBuffer(_meshletTriangleBuffer);
     _vkContext.destroyBuffer(_meshletVertexRefBuffer);
-    _vkContext.destroyBuffer(_clusterVertexBuffer);
+    _vkContext.destroyBuffer(_vertexAttributeBuffer);
+    _vkContext.destroyBuffer(_vertexPositionBuffer);
     _vkContext.destroyBuffer(_meshletBuffer);
+    for (Texture &texture : _textures) {
+      _vkContext.destroyTexture(texture);
+    }
+    vkDestroySampler(_vkContext.device(), _materialSampler, nullptr);
     vkDestroyPipeline(_vkContext.device(), _graphicsPipeline, nullptr);
     vkDestroyPipelineLayout(_vkContext.device(), _pipelineLayout, nullptr);
     vkDestroyDescriptorPool(_vkContext.device(), _descriptorPool, nullptr);
@@ -92,7 +111,8 @@ void Renderer::cleanup() {
 
 void Renderer::createDescriptorSetLayout() {
   std::array<VkDescriptorSetLayoutBinding, kBindingCount> bindings{};
-  for (uint32_t binding = 0; binding < bindings.size(); ++binding) {
+  std::array<VkDescriptorBindingFlags, kBindingCount> bindingFlags{};
+  for (uint32_t binding = 0; binding < kStorageBufferBindingCount; ++binding) {
     bindings[binding] = {
         .binding = binding,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -100,9 +120,29 @@ void Renderer::createDescriptorSetLayout() {
         .stageFlags = kDrawStages,
     };
   }
+  bindings[kBindingSampler] = {
+      .binding = kBindingSampler,
+      .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
+      .descriptorCount = 1,
+      .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+  };
+  // bindless: only the first _textures.size() entries are ever written
+  bindings[kBindingTextures] = {
+      .binding = kBindingTextures,
+      .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+      .descriptorCount = kMaxTextures,
+      .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+  };
+  bindingFlags[kBindingTextures] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
 
+  VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlagsInfo{
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
+      .bindingCount = static_cast<uint32_t>(bindingFlags.size()),
+      .pBindingFlags = bindingFlags.data(),
+  };
   VkDescriptorSetLayoutCreateInfo layoutInfo{
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .pNext = &bindingFlagsInfo,
       .bindingCount = static_cast<uint32_t>(bindings.size()),
       .pBindings = bindings.data(),
   };
@@ -165,7 +205,7 @@ void Renderer::createGraphicsPipeline() {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
       .polygonMode = VK_POLYGON_MODE_FILL,
       .cullMode = VK_CULL_MODE_BACK_BIT,
-      .frontFace = VK_FRONT_FACE_CLOCKWISE,
+      .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
       .lineWidth = 1.0f,
   };
 
@@ -297,16 +337,26 @@ void Renderer::createImgui() {
 }
 
 void Renderer::createDescriptorPool() {
-  VkDescriptorPoolSize poolSize{
-      .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-      .descriptorCount = kBindingCount,
-  };
+  const std::array<VkDescriptorPoolSize, 3> poolSizes{{
+      {
+          .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          .descriptorCount = kStorageBufferBindingCount,
+      },
+      {
+          .type = VK_DESCRIPTOR_TYPE_SAMPLER,
+          .descriptorCount = 1,
+      },
+      {
+          .type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+          .descriptorCount = kMaxTextures,
+      },
+  }};
 
   VkDescriptorPoolCreateInfo poolInfo{
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
       .maxSets = 1,
-      .poolSizeCount = 1,
-      .pPoolSizes = &poolSize,
+      .poolSizeCount = static_cast<uint32_t>(poolSizes.size()),
+      .pPoolSizes = poolSizes.data(),
   };
 
   const VkResult createDescriptorPoolResult = vkCreateDescriptorPool(
@@ -330,6 +380,37 @@ void Renderer::createDescriptorSet() {
          "failed to allocate descriptor set");
 }
 
+void Renderer::createSampler() {
+  // one trilinear, anisotropic, repeating sampler for every material texture;
+  // per-texture glTF sampler settings are ignored for now.
+  VkSamplerCreateInfo samplerInfo{
+      .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+      .magFilter = VK_FILTER_LINEAR,
+      .minFilter = VK_FILTER_LINEAR,
+      .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+      .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+      .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+      .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+      .anisotropyEnable = VK_TRUE,
+      .maxAnisotropy = 16.0f,
+      .maxLod = VK_LOD_CLAMP_NONE,
+  };
+  const VkResult createSamplerResult = vkCreateSampler(
+      _vkContext.device(), &samplerInfo, nullptr, &_materialSampler);
+  assert(createSamplerResult == VK_SUCCESS && "failed to create sampler");
+
+  VkDescriptorImageInfo imageInfo{.sampler = _materialSampler};
+  VkWriteDescriptorSet descriptorWrite{
+      .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+      .dstSet = _descriptorSet,
+      .dstBinding = kBindingSampler,
+      .descriptorCount = 1,
+      .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
+      .pImageInfo = &imageInfo,
+  };
+  vkUpdateDescriptorSets(_vkContext.device(), 1, &descriptorWrite, 0, nullptr);
+}
+
 void Renderer::updateInstanceDescriptorSet() {
   const VkDeviceSize bufferSize =
       sizeof(InstanceData) * _instanceBufferCapacity;
@@ -343,7 +424,7 @@ void Renderer::updateInstanceDescriptorSet() {
   VkWriteDescriptorSet descriptorWrite{
       .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
       .dstSet = _descriptorSet,
-      .dstBinding = 0,
+      .dstBinding = kBindingInstances,
       .descriptorCount = 1,
       .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
       .pBufferInfo = &bufferInfo,
@@ -353,42 +434,57 @@ void Renderer::updateInstanceDescriptorSet() {
 }
 
 void Renderer::updateMeshDescriptorSet() {
-  assert(!_meshlets.empty());
-  assert(!_clusterVertices.empty());
-  assert(!_meshletVertexRefs.empty());
-  assert(!_packedClusterTriangles.empty());
-
-  std::array<VkDescriptorBufferInfo, 4> bufferInfos{{
-      {
-          .buffer = _meshletBuffer.buffer,
-          .range = sizeof(Meshlet) * _meshlets.size(),
-      },
-      {
-          .buffer = _clusterVertexBuffer.buffer,
-          .range = sizeof(MeshletVertex) * _clusterVertices.size(),
-      },
-      {
-          .buffer = _clusterTriangleBuffer.buffer,
-          .range = sizeof(uint32_t) * _packedClusterTriangles.size(),
-      },
-      {
-          .buffer = _meshletVertexRefBuffer.buffer,
-          .range = sizeof(uint32_t) * _meshletVertexRefs.size(),
-      },
+  const std::array<std::pair<Binding, VkDescriptorBufferInfo>, 6> buffers{{
+      {kBindingMeshlets,
+       {.buffer = _meshletBuffer.buffer,
+        .range = sizeof(Meshlet) * _meshlets.size()}},
+      {kBindingVertexPositions,
+       {.buffer = _vertexPositionBuffer.buffer,
+        .range = sizeof(VertexPosition) * _vertexPositions.size()}},
+      {kBindingVertexAttributes,
+       {.buffer = _vertexAttributeBuffer.buffer,
+        .range = sizeof(VertexAttributes) * _vertexAttributes.size()}},
+      {kBindingMeshletVertexRefs,
+       {.buffer = _meshletVertexRefBuffer.buffer,
+        .range = sizeof(uint32_t) * _meshletVertexRefs.size()}},
+      {kBindingMeshletTriangles,
+       {.buffer = _meshletTriangleBuffer.buffer,
+        .range = sizeof(uint32_t) * _meshletTriangles.size()}},
+      {kBindingMaterials,
+       {.buffer = _materialBuffer.buffer,
+        .range = sizeof(Material) * _materials.size()}},
   }};
 
-  constexpr std::array<uint32_t, 4> kBindings = {1, 2, 3, 4};
-  std::array<VkWriteDescriptorSet, 4> descriptorWrites{};
-  for (uint32_t writeIndex = 0; writeIndex < descriptorWrites.size();
-       ++writeIndex) {
-    descriptorWrites[writeIndex] = {
+  std::vector<VkWriteDescriptorSet> descriptorWrites;
+  for (const auto &[binding, bufferInfo] : buffers) {
+    assert(bufferInfo.buffer != VK_NULL_HANDLE && bufferInfo.range > 0);
+    descriptorWrites.push_back({
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .dstSet = _descriptorSet,
-        .dstBinding = kBindings[writeIndex],
+        .dstBinding = binding,
         .descriptorCount = 1,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .pBufferInfo = &bufferInfos[writeIndex],
-    };
+        .pBufferInfo = &bufferInfo,
+    });
+  }
+
+  std::vector<VkDescriptorImageInfo> imageInfos;
+  imageInfos.reserve(_textures.size());
+  for (const Texture &texture : _textures) {
+    imageInfos.push_back({
+        .imageView = texture.view,
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    });
+  }
+  if (!imageInfos.empty()) {
+    descriptorWrites.push_back({
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = _descriptorSet,
+        .dstBinding = kBindingTextures,
+        .descriptorCount = static_cast<uint32_t>(imageInfos.size()),
+        .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+        .pImageInfo = imageInfos.data(),
+    });
   }
 
   vkUpdateDescriptorSets(_vkContext.device(),
@@ -417,7 +513,7 @@ void Renderer::updateRenderBucketDescriptorSet() {
     descriptorWrites[writeIndex] = {
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .dstSet = _descriptorSet,
-        .dstBinding = 5 + writeIndex,
+        .dstBinding = kBindingCandidateMeshlets + writeIndex,
         .descriptorCount = 1,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .pBufferInfo = &bufferInfos[writeIndex],
@@ -432,55 +528,84 @@ void Renderer::updateRenderBucketDescriptorSet() {
 MeshId Renderer::loadModel(const GltfModel &model) {
   MeshUploadInfo info{
       .firstMeshlet = static_cast<uint32_t>(_meshlets.size()),
-      .meshletCount = static_cast<uint32_t>(model.packedMeshlets.size()),
+      .meshletCount = static_cast<uint32_t>(model.meshlets.size()),
   };
-  const uint32_t clusterVertexBase =
-      static_cast<uint32_t>(_clusterVertices.size());
+  const uint32_t vertexBase = static_cast<uint32_t>(_vertexPositions.size());
   const uint32_t meshletVertexRefBase =
       static_cast<uint32_t>(_meshletVertexRefs.size());
-  const uint32_t clusterTriangleBase =
-      static_cast<uint32_t>(_packedClusterTriangles.size());
+  const uint32_t meshletTriangleBase =
+      static_cast<uint32_t>(_meshletTriangles.size());
+  const uint32_t materialBase = static_cast<uint32_t>(_materials.size());
+  const uint32_t textureBase = static_cast<uint32_t>(_textures.size());
+  assert(textureBase + model.textures.size() <= kMaxTextures);
 
-  _packedClusterTriangles.insert(_packedClusterTriangles.end(),
-                                 model.packedClusterTriangles.begin(),
-                                 model.packedClusterTriangles.end());
-
-  _clusterVertices.insert(_clusterVertices.end(),
-                          model.packedClusterVertices.begin(),
-                          model.packedClusterVertices.end());
-
-  _meshletVertexRefs.reserve(_meshletVertexRefs.size() +
-                             model.packedMeshletVertexRefs.size());
-  for (uint32_t vertexRef : model.packedMeshletVertexRefs) {
-    _meshletVertexRefs.push_back(clusterVertexBase + vertexRef);
+  _vertexPositions.insert(_vertexPositions.end(), model.positions.begin(),
+                          model.positions.end());
+  _vertexAttributes.insert(_vertexAttributes.end(), model.attributes.begin(),
+                           model.attributes.end());
+  for (const uint32_t index : model.indices) {
+    _indices.push_back(vertexBase + index);
   }
+  for (const uint32_t vertexRef : model.meshletVertexRefs) {
+    _meshletVertexRefs.push_back(vertexBase + vertexRef);
+  }
+  _meshletTriangles.insert(_meshletTriangles.end(),
+                           model.meshletTriangles.begin(),
+                           model.meshletTriangles.end());
 
-  _meshlets.insert(_meshlets.end(), model.packedMeshlets.begin(),
-                   model.packedMeshlets.end());
-  for (auto it = _meshlets.begin() + info.firstMeshlet; it != _meshlets.end();
-       ++it) {
-    Meshlet &meshlet = *it;
+  for (Meshlet meshlet : model.meshlets) {
     meshlet.vertexOffset += meshletVertexRefBase;
-    meshlet.triangleOffset += clusterTriangleBase;
+    meshlet.triangleOffset += meshletTriangleBase;
+    meshlet.materialIndex += materialBase;
+    _meshlets.push_back(meshlet);
   }
+
+  const auto rebase = [textureBase](uint32_t &texture) {
+    if (texture != kInvalidTexture) {
+      texture += textureBase;
+    }
+  };
+  for (Material material : model.materials) {
+    rebase(material.baseColorTexture);
+    rebase(material.metallicRoughnessTexture);
+    rebase(material.normalTexture);
+    rebase(material.occlusionTexture);
+    rebase(material.emissiveTexture);
+    _materials.push_back(material);
+  }
+
+  uploadTextures(model.textures);
   _meshes.push_back(info);
 
   rebuildMeshBuffers();
   return static_cast<MeshId>(_meshes.size() - 1);
 }
 
-void Renderer::rebuildMeshBuffers() {
+void Renderer::uploadTextures(const std::vector<TextureData> &textures) {
+  for (const TextureData &texture : textures) {
+    _textures.push_back(_vkContext.createTexture(
+        texture.width, texture.height,
+        texture.srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM,
+        texture.rgba.data()));
+  }
+}
 
+void Renderer::rebuildMeshBuffers() {
+  _vkContext.waitIdle();
   uploadDeviceLocalBuffer(_meshlets, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                           _meshletBuffer);
-  uploadDeviceLocalBuffer(_clusterVertices, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                          _clusterVertexBuffer);
+  uploadDeviceLocalBuffer(_vertexPositions, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                          _vertexPositionBuffer);
+  uploadDeviceLocalBuffer(_vertexAttributes,
+                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                          _vertexAttributeBuffer);
   uploadDeviceLocalBuffer(_meshletVertexRefs,
                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                           _meshletVertexRefBuffer);
-  uploadDeviceLocalBuffer(_packedClusterTriangles,
-                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                          _clusterTriangleBuffer);
+  uploadDeviceLocalBuffer(_meshletTriangles, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                          _meshletTriangleBuffer);
+  uploadDeviceLocalBuffer(_materials, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                          _materialBuffer);
   updateMeshDescriptorSet();
 }
 
@@ -718,6 +843,20 @@ void Renderer::renderImgui(VkCommandBuffer commandBuffer, float dt) {
   ImGui::Text("rendered triangles: %s / %s", visibleTriangles.c_str(),
               totalTriangles.c_str());
 
+  ImGui::Separator();
+  int debugView = static_cast<int>(_debugView);
+  ImGui::SetNextItemWidth(160.0f);
+  if (ImGui::Combo("view", &debugView, kDebugViewNames,
+                   IM_ARRAYSIZE(kDebugViewNames))) {
+    _debugView = static_cast<uint32_t>(debugView);
+  }
+  ImGui::SetNextItemWidth(160.0f);
+  ImGui::SliderFloat("light azimuth", &_lightAzimuth, -180.0f, 180.0f);
+  ImGui::SetNextItemWidth(160.0f);
+  ImGui::SliderFloat("light elevation", &_lightElevation, -10.0f, 90.0f);
+  ImGui::SetNextItemWidth(160.0f);
+  ImGui::SliderFloat("light intensity", &_lightIntensity, 0.0f, 10.0f);
+
   ImGui::End();
 
   ImGui::Render();
@@ -805,12 +944,21 @@ void Renderer::recordRenderingCommands(VkCommandBuffer commandBuffer,
   if (!_candidateMeshlets.empty()) {
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                             _pipelineLayout, 0, 1, &_descriptorSet, 0, nullptr);
+    const float azimuth = glm::radians(_lightAzimuth);
+    const float elevation = glm::radians(_lightElevation);
+    const glm::vec3 towardsLight{std::cos(elevation) * std::sin(azimuth),
+                                 std::sin(elevation),
+                                 std::cos(elevation) * std::cos(azimuth)};
     DrawPushConstants pushConstants{
         .viewProjection = viewProjection,
         .view = cullData.view,
         .frustum = cullData.frustum,
         .zNearFar = cullData.zNearFar,
         .candidateCount = static_cast<uint32_t>(_candidateMeshlets.size()),
+        .debugView = _debugView,
+        .cameraPosition = glm::vec4(glm::vec3(glm::inverse(cullData.view)[3]),
+                                    1.0f),
+        .lightDirection = glm::vec4(-towardsLight, _lightIntensity),
     };
     vkCmdPushConstants(commandBuffer, _pipelineLayout, kDrawStages, 0,
                        sizeof(DrawPushConstants), &pushConstants);

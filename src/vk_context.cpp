@@ -4,7 +4,9 @@
 #include "math_helper.h"
 
 #include <GLFW/glfw3.h>
+#include <algorithm>
 #include <cassert>
+#include <cstring>
 #include <iostream>
 
 namespace {
@@ -378,14 +380,25 @@ void VkContext::createLogicalDevice() {
       .taskShader = VK_TRUE,
       .meshShader = VK_TRUE,
   };
+  VkPhysicalDeviceVulkan12Features vulkan12Features{
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+      .pNext = &meshShaderFeatures,
+      // bindless texture array
+      .shaderSampledImageArrayNonUniformIndexing = VK_TRUE,
+      .descriptorBindingPartiallyBound = VK_TRUE,
+      .runtimeDescriptorArray = VK_TRUE,
+  };
   VkPhysicalDeviceVulkan13Features vulkan13Features{
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-      .pNext = &meshShaderFeatures,
+      .pNext = &vulkan12Features,
+      // DXC lowers discard to OpDemoteToHelperInvocation
+      .shaderDemoteToHelperInvocation = VK_TRUE,
       .dynamicRendering = VK_TRUE,
   };
   VkPhysicalDeviceFeatures2 deviceFeatures{
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
       .pNext = &vulkan13Features,
+      .features = {.samplerAnisotropy = VK_TRUE},
   };
   VkDeviceCreateInfo createInfo{
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
@@ -542,11 +555,12 @@ void VkContext::createImageViews() {
   _swapChainImageViews.resize(_swapChainImages.size());
   for (size_t i = 0; i < _swapChainImages.size(); ++i) {
     _swapChainImageViews[i] = createImageView(
-        _swapChainImages[i], _swapChainImageFormat, VK_IMAGE_ASPECT_COLOR_BIT);
+        _swapChainImages[i], _swapChainImageFormat, 1, VK_IMAGE_ASPECT_COLOR_BIT);
   }
 }
 
 VkImageView VkContext::createImageView(VkImage image, VkFormat format,
+                                       uint32_t mipLevels,
                                        VkImageAspectFlags aspectFlags) const {
   VkImageViewCreateInfo createInfo{
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
@@ -556,7 +570,7 @@ VkImageView VkContext::createImageView(VkImage image, VkFormat format,
       .subresourceRange =
           {
               .aspectMask = aspectFlags,
-              .levelCount = 1,
+              .levelCount = mipLevels,
               .layerCount = 1,
           },
   };
@@ -573,7 +587,7 @@ void VkContext::createDepthResources() {
               VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, _depthImage);
   _depthImage.view = createImageView(_depthImage.image, VK_FORMAT_D32_SFLOAT,
-                                     VK_IMAGE_ASPECT_DEPTH_BIT);
+                                     1, VK_IMAGE_ASPECT_DEPTH_BIT);
 }
 
 void VkContext::createCommandBuffers() {
@@ -695,8 +709,8 @@ RenderTargetInfo VkContext::renderTargetInfo() const {
   };
 }
 
-void VkContext::copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer,
-                           VkDeviceSize size) {
+void VkContext::immediateSubmit(
+    const std::function<void(VkCommandBuffer)> &record) const {
   VkCommandBufferAllocateInfo allocInfo{
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
       .commandPool = _commandPool,
@@ -711,11 +725,7 @@ void VkContext::copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer,
       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
   };
   vkBeginCommandBuffer(commandBuffer, &beginInfo);
-
-  VkBufferCopy copyRegion{
-      .size = size,
-  };
-  vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+  record(commandBuffer);
   vkEndCommandBuffer(commandBuffer);
 
   VkSubmitInfo submitInfo{
@@ -726,6 +736,159 @@ void VkContext::copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer,
   vkQueueSubmit(_graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
   vkQueueWaitIdle(_graphicsQueue);
   vkFreeCommandBuffers(_device, _commandPool, 1, &commandBuffer);
+}
+
+void VkContext::copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer,
+                           VkDeviceSize size) {
+  immediateSubmit([&](VkCommandBuffer commandBuffer) {
+    VkBufferCopy copyRegion{
+        .size = size,
+    };
+    vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+  });
+}
+
+Texture VkContext::createTexture(uint32_t width, uint32_t height,
+                                 VkFormat format, const void *pixels) {
+  const VkDeviceSize size = VkDeviceSize{width} * height * 4;
+  Buffer<uint8_t> staging;
+  createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+               staging);
+  void *data = nullptr;
+  vmaMapMemory(_allocator, staging.allocation, &data);
+  std::memcpy(data, pixels, static_cast<size_t>(size));
+  vmaUnmapMemory(_allocator, staging.allocation);
+
+  uint32_t mipLevels = 1;
+  for (uint32_t extent = std::max(width, height); extent > 1; extent /= 2) {
+    ++mipLevels;
+  }
+
+  VkImageCreateInfo imageInfo{
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = VK_IMAGE_TYPE_2D,
+      .format = format,
+      .extent = {.width = width, .height = height, .depth = 1},
+      .mipLevels = mipLevels,
+      .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+               VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+  };
+  VmaAllocationCreateInfo allocationInfo{
+      .usage = VMA_MEMORY_USAGE_AUTO,
+      .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+  };
+  Texture texture;
+  const VkResult createImageResult =
+      vmaCreateImage(_allocator, &imageInfo, &allocationInfo, &texture.image,
+                     &texture.allocation, nullptr);
+  assert(createImageResult == VK_SUCCESS && "failed to create texture");
+
+  const auto barrier = [&](VkCommandBuffer commandBuffer, uint32_t mip,
+                           uint32_t mipCount, VkImageLayout oldLayout,
+                           VkImageLayout newLayout, VkAccessFlags srcAccess,
+                           VkAccessFlags dstAccess,
+                           VkPipelineStageFlags srcStage,
+                           VkPipelineStageFlags dstStage) {
+    VkImageMemoryBarrier imageBarrier{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = srcAccess,
+        .dstAccessMask = dstAccess,
+        .oldLayout = oldLayout,
+        .newLayout = newLayout,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = texture.image,
+        .subresourceRange =
+            {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = mip,
+                .levelCount = mipCount,
+                .layerCount = 1,
+            },
+    };
+    vkCmdPipelineBarrier(commandBuffer, srcStage, dstStage, 0, 0, nullptr, 0,
+                         nullptr, 1, &imageBarrier);
+  };
+
+  immediateSubmit([&](VkCommandBuffer commandBuffer) {
+    barrier(commandBuffer, 0, mipLevels, VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    VkBufferImageCopy copyRegion{
+        .imageSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                             .layerCount = 1},
+        .imageExtent = {.width = width, .height = height, .depth = 1},
+    };
+    vkCmdCopyBufferToImage(commandBuffer, staging.buffer, texture.image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                           &copyRegion);
+
+    // each mip is blitted from the previous one, which is then made readable
+    int32_t mipWidth = static_cast<int32_t>(width);
+    int32_t mipHeight = static_cast<int32_t>(height);
+    for (uint32_t mip = 1; mip < mipLevels; ++mip) {
+      barrier(commandBuffer, mip - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+              VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+              VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+      const int32_t nextWidth = std::max(mipWidth / 2, 1);
+      const int32_t nextHeight = std::max(mipHeight / 2, 1);
+      VkImageBlit blit{
+          .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                             .mipLevel = mip - 1,
+                             .layerCount = 1},
+          .srcOffsets = {{0, 0, 0}, {mipWidth, mipHeight, 1}},
+          .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                             .mipLevel = mip,
+                             .layerCount = 1},
+          .dstOffsets = {{0, 0, 0}, {nextWidth, nextHeight, 1}},
+      };
+      vkCmdBlitImage(commandBuffer, texture.image,
+                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texture.image,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                     VK_FILTER_LINEAR);
+
+      barrier(commandBuffer, mip - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+              VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+              VK_PIPELINE_STAGE_TRANSFER_BIT,
+              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+      mipWidth = nextWidth;
+      mipHeight = nextHeight;
+    }
+
+    barrier(commandBuffer, mipLevels - 1, 1,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+  });
+
+  destroyBuffer(staging);
+  texture.view = createImageView(texture.image, format, mipLevels,
+                                 VK_IMAGE_ASPECT_COLOR_BIT);
+  return texture;
+}
+
+void VkContext::destroyTexture(Texture &texture) const {
+  if (texture.view != VK_NULL_HANDLE) {
+    vkDestroyImageView(_device, texture.view, nullptr);
+  }
+  if (texture.image != VK_NULL_HANDLE) {
+    vmaDestroyImage(_allocator, texture.image, texture.allocation);
+  }
+  texture = {};
 }
 
 VkShaderModule

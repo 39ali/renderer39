@@ -52,6 +52,8 @@ private:
   void createDescriptorSet();
   void updateInstanceDescriptorSet();
   void updateMeshDescriptorSet();
+  void createSampler();
+  void uploadTextures(const std::vector<TextureData> &textures);
   void updateRenderBucketDescriptorSet();
   void rebuildMeshBuffers();
   void uploadRenderBucket();
@@ -78,9 +80,14 @@ private:
   VkContext _vkContext;
   Resources _resources;
   std::vector<Meshlet> _meshlets;
-  std::vector<MeshletVertex> _clusterVertices;
+  std::vector<VertexPosition> _vertexPositions;
+  std::vector<VertexAttributes> _vertexAttributes;
+  // CPU only; kept for acceleration structure builds
+  std::vector<uint32_t> _indices;
   std::vector<uint32_t> _meshletVertexRefs;
-  std::vector<uint32_t> _packedClusterTriangles;
+  std::vector<uint32_t> _meshletTriangles;
+  std::vector<Material> _materials;
+  std::vector<Texture> _textures;
   std::vector<MeshUploadInfo> _meshes;
   std::vector<InstanceData> _frameInstances;
   std::vector<MeshletInstance> _candidateMeshlets;
@@ -92,12 +99,19 @@ private:
   VkDescriptorPool _imguiDescriptorPool = VK_NULL_HANDLE;
   VkDescriptorSet _descriptorSet = VK_NULL_HANDLE;
   Buffer<Meshlet> _meshletBuffer;
-  Buffer<MeshletVertex> _clusterVertexBuffer;
+  Buffer<VertexPosition> _vertexPositionBuffer;
+  Buffer<VertexAttributes> _vertexAttributeBuffer;
   Buffer<uint32_t> _meshletVertexRefBuffer;
-  Buffer<uint32_t> _clusterTriangleBuffer;
+  Buffer<uint32_t> _meshletTriangleBuffer;
+  Buffer<Material> _materialBuffer;
+  VkSampler _materialSampler = VK_NULL_HANDLE;
   Buffer<InstanceData> _instanceBuffer;
   RenderBucket _renderBucket;
   size_t _instanceBufferCapacity = 0;
   size_t _candidateMeshletCapacity = 0;
   RenderStats _stats;
+  uint32_t _debugView = kDebugViewLit;
+  float _lightAzimuth = 45.0f;
+  float _lightElevation = 50.0f;
+  float _lightIntensity = 3.0f;
 };

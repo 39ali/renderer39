@@ -8,7 +8,6 @@
 
 #include <chrono>
 #include <iostream>
-#include <random>
 
 constexpr uint32_t kWidth = 1920;
 constexpr uint32_t kHeight = 1080;
@@ -41,53 +40,33 @@ void App::initWindow() {
 }
 
 void App::initScene() {
-  GltfModel duckModel = _resources.loadGltfModel("assets/Duck.glb");
-  std::cout << "Duck meshlets: " << duckModel.packedMeshlets.size()
-            << ", triangles: " << duckModel.packedClusterTriangles.size()
-            << '\n';
-  const MeshId duckMesh = _renderer->loadModel(duckModel);
+  struct SceneModel {
+    const char *path;
+    glm::vec3 position;
+  };
+  // each model is scaled to a bounding radius of 1 and placed on the X axis
+  const SceneModel sceneModels[] = {
+      {"assets/DamagedHelmet.glb", {0.0f, 0.0f, 0.0f}},
+      {"assets/Duck.glb", {2.5f, 0.0f, 0.0f}},
+      {"assets/kitten.glb", {-2.5f, 0.0f, 0.0f}},
+  };
 
-  GltfModel kittenModel = _resources.loadGltfModel("assets/Kitten.glb");
-  std::cout << "Kitten meshlets: " << kittenModel.packedMeshlets.size()
-            << ", triangles: " << kittenModel.packedClusterTriangles.size()
-            << '\n';
-  const MeshId kittenMesh = _renderer->loadModel(kittenModel);
+  for (const SceneModel &sceneModel : sceneModels) {
+    const GltfModel model = _resources.loadGltfModel(sceneModel.path);
+    std::cout << sceneModel.path << ": " << model.meshlets.size()
+              << " meshlets, " << model.indices.size() / 3 << " triangles, "
+              << model.materials.size() << " materials, "
+              << model.textures.size() << " textures\n";
 
-  constexpr int kObjectCount = 5'000; // 10'000;
-  constexpr float kSceneRadius = 4.0f;
-  _objects.reserve(kObjectCount);
-
-  std::random_device randomDevice;
-  std::mt19937 generator(randomDevice());
-  std::uniform_real_distribution<float> randomFloat(0.0f, 1.0f);
-
-  for (int i = 0; i < kObjectCount; ++i) {
-    glm::vec3 position{};
-    do {
-      position = glm::vec3{randomFloat(generator) * 2.0f - 1.0f,
-                           randomFloat(generator) * 2.0f - 1.0f,
-                           randomFloat(generator) * 2.0f - 1.0f} *
-                 kSceneRadius;
-    } while (glm::dot(position, position) > kSceneRadius * kSceneRadius);
-
-    const MeshId mesh = randomFloat(generator) < 0.5f ? duckMesh : kittenMesh;
-    Object3D object(mesh);
-    object.position = position;
-    const float scale = 0.08f + randomFloat(generator) * 0.16f;
-    object.scale = glm::vec3{mesh == kittenMesh ? scale * 2.f : scale};
-    const float yaw = randomFloat(generator) * glm::two_pi<float>();
-    const float pitch = (randomFloat(generator) - 0.5f) * glm::radians(25.0f);
-    const float roll = (randomFloat(generator) - 0.5f) * glm::radians(25.0f);
-    object.rotation = glm::angleAxis(yaw, glm::vec3{0.0f, 1.0f, 0.0f}) *
-                      glm::angleAxis(pitch + glm::radians(180.0f),
-                                     glm::vec3{1.0f, 0.0f, 0.0f}) *
-                      glm::angleAxis(roll, glm::vec3{0.0f, 0.0f, 1.0f});
-    object.color = {randomFloat(generator), randomFloat(generator),
-                    randomFloat(generator), 1.0f};
+    Object3D object(_renderer->loadModel(model));
+    const float scale =
+        model.boundsRadius > 0.0f ? 1.0f / model.boundsRadius : 1.0f;
+    object.scale = glm::vec3(scale);
+    object.position = sceneModel.position - model.boundsCenter * scale;
     _objects.push_back(object);
   }
 
-  _camera.lookAt(glm::vec3{0.0f, 0.0f, kSceneRadius * 2.4f}, glm::vec3{0.0f});
+  _camera.lookAt(glm::vec3{0.0f, 0.5f, 5.0f}, glm::vec3{0.0f});
   _renderer->setObjects(_objects);
 }
 

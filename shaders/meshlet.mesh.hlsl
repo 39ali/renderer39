@@ -1,24 +1,4 @@
-#include "shared_structs.h"
-
-[[vk::push_constant]] DrawPushConstants pc;
-
-[[vk::binding(0, 0)]] StructuredBuffer<InstanceData> instances;
-[[vk::binding(1, 0)]] StructuredBuffer<Meshlet> meshlets;
-[[vk::binding(2, 0)]] StructuredBuffer<MeshletVertex> vertices;
-[[vk::binding(3, 0)]] StructuredBuffer<uint> clusterTriangles;
-[[vk::binding(4, 0)]] StructuredBuffer<uint> meshletVertexRefs;
-
-struct VertexOutput {
-  float4 position : SV_Position;
-  [[vk::location(0)]] float3 normal : NORMAL;
-  [[vk::location(1)]] float4 color : COLOR;
-};
-
-float4 unpackColor(uint color) {
-  return float4(float(color & 0xffu), float((color >> 8) & 0xffu),
-                float((color >> 16) & 0xffu), float((color >> 24) & 0xffu)) /
-         255.0;
-}
+#include "scene_bindings.hlsli"
 
 // one workgroup per visible meshlet; each thread emits at most one vertex and
 // one triangle.
@@ -37,32 +17,39 @@ void main(uint threadIndex : SV_GroupThreadID, uint3 groupId : SV_GroupID,
   SetMeshOutputCounts(vertexCount, triangleCount);
 
   if (threadIndex < vertexCount) {
-    const uint vertexIndex = meshletVertexRefs[meshlet.vertexOffset + threadIndex];
-    const MeshletVertex vertex = vertices[vertexIndex];
+    const uint vertexIndex =
+        meshletVertexRefs[meshlet.vertexOffset + threadIndex];
+    const VertexPosition p = vertexPositions[vertexIndex];
+    const VertexAttributes attributes = vertexAttributes[vertexIndex];
 
-    float2 positionXY = unpackHalf2x16(vertex.positionXY);
-    float2 positionZNormalX = unpackHalf2x16(vertex.positionZNormalX);
-    float2 normalYZ = unpackHalf2x16(vertex.normalYZ);
-    float3 position = float3(positionXY.x, positionXY.y, positionZNormalX.x);
-    float3 normal =
-        normalize(float3(positionZNormalX.y, normalYZ.x, normalYZ.y));
+    const float3 scale = float3(instance.translationScaleX.w,
+                                instance.scaleYZ.x, instance.scaleYZ.y);
+    const float3 worldPosition =
+        instance.translationScaleX.xyz +
+        rotateByQuat(float3(p.x, p.y, p.z) * scale, instance.rotation);
 
-    float3 scale = float3(instance.translationScaleX.w, instance.scaleYZ.x,
-                          instance.scaleYZ.y);
-    float3 worldPosition = instance.translationScaleX.xyz +
-                           rotateByQuat(position * scale, instance.rotation);
+    // normals take the inverse scale, tangents the forward scale
+    const float3 normal = octDecode(unpackSnorm2x16(attributes.normal));
+    const float3 tangent = octDecode(unpackSnorm2x16(attributes.tangent));
+    const float tangentSign = (attributes.tangent & 1u) != 0u ? -1.0 : 1.0;
 
     VertexOutput output;
     output.position = mul(pc.viewProjection, float4(worldPosition, 1.0));
-    output.normal = normalize(rotateByQuat(normal, instance.rotation));
-    output.color = unpackColor(instance.packedColor);
+    output.worldPosition = worldPosition;
+    output.normal =
+        normalize(rotateByQuat(normal / scale, instance.rotation));
+    output.tangent = float4(
+        normalize(rotateByQuat(tangent * scale, instance.rotation)),
+        tangentSign);
+    output.uv = attributes.uv;
+    output.materialIndex = meshlet.materialIndex;
     outVertices[threadIndex] = output;
   }
 
   if (threadIndex < triangleCount) {
     // three 10-bit meshlet-local vertex indices
     const uint packedTriangle =
-        clusterTriangles[meshlet.triangleOffset + threadIndex];
+        meshletTriangles[meshlet.triangleOffset + threadIndex];
     outTriangles[threadIndex] =
         uint3(packedTriangle & 0x3ffu, (packedTriangle >> 10u) & 0x3ffu,
               (packedTriangle >> 20u) & 0x3ffu);

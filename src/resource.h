@@ -8,11 +8,31 @@
 
 using MeshId = uint32_t;
 
+struct TextureData {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  // base color and emissive are sRGB; data textures are linear.
+  bool srgb = false;
+  // tightly packed RGBA8
+  std::vector<uint8_t> rgba;
+};
+
+// one glTF file flattened into a single mesh; node transforms are baked in.
 struct GltfModel {
-  std::vector<MeshletVertex> packedClusterVertices;
-  std::vector<uint32_t> packedMeshletVertexRefs;
-  std::vector<uint32_t> packedClusterTriangles;
-  std::vector<Meshlet> packedMeshlets;
+  std::vector<VertexPosition> positions;
+  std::vector<VertexAttributes> attributes;
+  // flat triangle list into positions/attributes; kept on the CPU for
+  // acceleration structure builds.
+  std::vector<uint32_t> indices;
+  std::vector<uint32_t> meshletVertexRefs;
+  std::vector<uint32_t> meshletTriangles;
+  // materialIndex indexes materials
+  std::vector<Meshlet> meshlets;
+  // texture indices index textures
+  std::vector<Material> materials;
+  std::vector<TextureData> textures;
+  glm::vec3 boundsCenter{0.0f};
+  float boundsRadius = 0.0f;
 };
 
 class Resources {

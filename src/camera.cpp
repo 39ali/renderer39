@@ -89,7 +89,11 @@ glm::mat4 Camera::viewMatrix() const {
 }
 
 glm::mat4 Camera::projectionMatrix() const {
-  return glm::perspective(glm::radians(_fovY), _aspect, _nearPlane, _farPlane);
+  glm::mat4 projection =
+      glm::perspective(glm::radians(_fovY), _aspect, _nearPlane, _farPlane);
+  // Vulkan clip space has Y pointing down
+  projection[1][1] *= -1.0f;
+  return projection;
 }
 
 glm::mat4 Camera::viewProjectionMatrix() const {

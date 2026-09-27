@@ -85,6 +85,8 @@ set(SHADER_SOURCES
 
 set(SHADER_INCLUDES
   ${CMAKE_CURRENT_SOURCE_DIR}/shaders/shared_structs.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene_bindings.hlsli
+  ${CMAKE_CURRENT_SOURCE_DIR}/shaders/brdf.hlsli
 )
 
 set(SPIRV_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)

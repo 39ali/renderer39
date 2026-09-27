@@ -10,21 +10,9 @@
 #include <string>
 
 namespace {
-struct PushConstants {
-  glm::mat4 viewProjection{1.0f};
-};
-
-struct ComputePushConstants {
-  glm::mat4 view{1.0f};
-  glm::vec4 frustum{1.0f};
-  glm::vec2 zNearFar{0.01f, 1000.0f};
-  uint32_t candidateCount = 0;
-  uint32_t mode = 0;
-  uint32_t meshletDrawCount = 0;
-  uint32_t padding0 = 0;
-};
-
-static_assert(sizeof(RenderCounters) == 8);
+constexpr uint32_t kBindingCount = 7;
+constexpr VkShaderStageFlags kDrawStages =
+    VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT;
 
 uint32_t packColor(const glm::vec4 &color) {
   const auto packChannel = [](float value) {
@@ -61,28 +49,10 @@ Renderer::Renderer(GLFWwindow *window, std::filesystem::path appDir)
 
 Renderer::~Renderer() { cleanup(); }
 
-void Renderer::setIndirectMode(IndirectMode mode) {
-  if (mode == IndirectMode::MultiDraw &&
-      _vkContext.supportsMultiDrawIndirect()) {
-    _indirectMode = IndirectMode::MultiDraw;
-  } else {
-    _indirectMode = IndirectMode::SingleDraw;
-  }
-
-  _indirectDrawCount = _indirectMode == IndirectMode::MultiDraw
-                           ? static_cast<uint32_t>(_meshletDrawMetas.size())
-                           : (_candidateMeshlets.empty() ? 0u : 1u);
-  if (!_candidateMeshlets.empty()) {
-    uploadRenderBucket();
-  }
-}
-
 void Renderer::init() {
   _vkContext.init();
-  setIndirectMode(IndirectMode::MultiDraw);
   createDescriptorSetLayout();
   createGraphicsPipeline();
-  createCullingPipeline();
   createDescriptorPool();
   createDescriptorSet();
   for (Buffer<RenderCounters> &buffer : _renderBucket.counterReadbackBuffers) {
@@ -104,17 +74,13 @@ void Renderer::cleanup() {
          _renderBucket.counterReadbackBuffers) {
       _vkContext.destroyBuffer(buffer);
     }
-    _vkContext.destroyBuffer(_renderBucket.meshletDrawMetaBuffer);
-    _vkContext.destroyBuffer(_renderBucket.drawArgumentBuffer);
     _vkContext.destroyBuffer(_renderBucket.counterBuffer);
-    _vkContext.destroyBuffer(_renderBucket.visibleMeshletBuffer);
     _vkContext.destroyBuffer(_renderBucket.candidateMeshletBuffer);
     _vkContext.destroyBuffer(_instanceBuffer);
     _vkContext.destroyBuffer(_clusterTriangleBuffer);
     _vkContext.destroyBuffer(_meshletVertexRefBuffer);
     _vkContext.destroyBuffer(_clusterVertexBuffer);
     _vkContext.destroyBuffer(_meshletBuffer);
-    vkDestroyPipeline(_vkContext.device(), _computePipeline, nullptr);
     vkDestroyPipeline(_vkContext.device(), _graphicsPipeline, nullptr);
     vkDestroyPipelineLayout(_vkContext.device(), _pipelineLayout, nullptr);
     vkDestroyDescriptorPool(_vkContext.device(), _descriptorPool, nullptr);
@@ -125,13 +91,13 @@ void Renderer::cleanup() {
 }
 
 void Renderer::createDescriptorSetLayout() {
-  std::array<VkDescriptorSetLayoutBinding, 10> bindings{};
+  std::array<VkDescriptorSetLayoutBinding, kBindingCount> bindings{};
   for (uint32_t binding = 0; binding < bindings.size(); ++binding) {
     bindings[binding] = {
         .binding = binding,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .descriptorCount = 1,
-        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+        .stageFlags = kDrawStages,
     };
   }
 
@@ -148,37 +114,33 @@ void Renderer::createDescriptorSetLayout() {
 }
 
 void Renderer::createGraphicsPipeline() {
-  const auto vertShaderCode = _resources.readBinary("shaders/gltf.vert.spv");
-  const auto fragShaderCode = _resources.readBinary("shaders/gltf.frag.spv");
-  const VkShaderModule vertShaderModule =
-      _vkContext.createShaderModule(vertShaderCode);
-  const VkShaderModule fragShaderModule =
-      _vkContext.createShaderModule(fragShaderCode);
+  const VkShaderModule taskShaderModule = _vkContext.createShaderModule(
+      _resources.readBinary("shaders/meshlet.task.spv"));
+  const VkShaderModule meshShaderModule = _vkContext.createShaderModule(
+      _resources.readBinary("shaders/meshlet.mesh.spv"));
+  const VkShaderModule fragShaderModule = _vkContext.createShaderModule(
+      _resources.readBinary("shaders/meshlet.frag.spv"));
 
-  VkPipelineShaderStageCreateInfo vertShaderStageInfo{
-      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-      .stage = VK_SHADER_STAGE_VERTEX_BIT,
-      .module = vertShaderModule,
-      .pName = "main",
-  };
-
-  VkPipelineShaderStageCreateInfo fragShaderStageInfo{
-      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-      .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-      .module = fragShaderModule,
-      .pName = "main",
-  };
-  VkPipelineShaderStageCreateInfo shaderStages[] = {vertShaderStageInfo,
-                                                    fragShaderStageInfo};
-
-  VkPipelineVertexInputStateCreateInfo vertexInputInfo{
-      .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-  };
-
-  VkPipelineInputAssemblyStateCreateInfo inputAssembly{
-      .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-      .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-  };
+  const std::array<VkPipelineShaderStageCreateInfo, 3> shaderStages{{
+      {
+          .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_TASK_BIT_EXT,
+          .module = taskShaderModule,
+          .pName = "main",
+      },
+      {
+          .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_MESH_BIT_EXT,
+          .module = meshShaderModule,
+          .pName = "main",
+      },
+      {
+          .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+          .module = fragShaderModule,
+          .pName = "main",
+      },
+  }};
 
   const RenderTargetInfo renderTarget = _vkContext.renderTargetInfo();
   VkViewport viewport{
@@ -233,10 +195,9 @@ void Renderer::createGraphicsPipeline() {
   };
 
   VkPushConstantRange pushConstantRange{
-      .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+      .stageFlags = kDrawStages,
       .offset = 0,
-      .size = static_cast<uint32_t>(
-          maxValue(sizeof(PushConstants), sizeof(ComputePushConstants))),
+      .size = sizeof(DrawPushConstants),
   };
 
   VkPipelineLayoutCreateInfo pipelineLayoutInfo{
@@ -261,10 +222,8 @@ void Renderer::createGraphicsPipeline() {
   VkGraphicsPipelineCreateInfo pipelineInfo{
       .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
       .pNext = &renderingInfo,
-      .stageCount = 2,
-      .pStages = shaderStages,
-      .pVertexInputState = &vertexInputInfo,
-      .pInputAssemblyState = &inputAssembly,
+      .stageCount = static_cast<uint32_t>(shaderStages.size()),
+      .pStages = shaderStages.data(),
       .pViewportState = &viewportState,
       .pRasterizationState = &rasterizer,
       .pMultisampleState = &multisampling,
@@ -282,34 +241,8 @@ void Renderer::createGraphicsPipeline() {
          "failed to create graphics pipeline");
 
   vkDestroyShaderModule(_vkContext.device(), fragShaderModule, nullptr);
-  vkDestroyShaderModule(_vkContext.device(), vertShaderModule, nullptr);
-}
-
-void Renderer::createCullingPipeline() {
-  const auto shaderCode =
-      _resources.readBinary("shaders/meshlet_cull.comp.spv");
-  const VkShaderModule shaderModule = _vkContext.createShaderModule(shaderCode);
-
-  VkPipelineShaderStageCreateInfo shaderStageInfo{
-      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-      .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-      .module = shaderModule,
-      .pName = "main",
-  };
-
-  VkComputePipelineCreateInfo pipelineInfo{
-      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-      .stage = shaderStageInfo,
-      .layout = _pipelineLayout,
-  };
-
-  const VkResult createComputePipelineResult =
-      vkCreateComputePipelines(_vkContext.device(), VK_NULL_HANDLE, 1,
-                               &pipelineInfo, nullptr, &_computePipeline);
-  assert(createComputePipelineResult == VK_SUCCESS &&
-         "failed to create compute pipeline");
-
-  vkDestroyShaderModule(_vkContext.device(), shaderModule, nullptr);
+  vkDestroyShaderModule(_vkContext.device(), meshShaderModule, nullptr);
+  vkDestroyShaderModule(_vkContext.device(), taskShaderModule, nullptr);
 }
 
 void Renderer::createImgui() {
@@ -366,7 +299,7 @@ void Renderer::createImgui() {
 void Renderer::createDescriptorPool() {
   VkDescriptorPoolSize poolSize{
       .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-      .descriptorCount = 10,
+      .descriptorCount = kBindingCount,
   };
 
   VkDescriptorPoolCreateInfo poolInfo{
@@ -444,7 +377,7 @@ void Renderer::updateMeshDescriptorSet() {
       },
   }};
 
-  constexpr std::array<uint32_t, 4> kBindings = {1, 2, 3, 9};
+  constexpr std::array<uint32_t, 4> kBindings = {1, 2, 3, 4};
   std::array<VkWriteDescriptorSet, 4> descriptorWrites{};
   for (uint32_t writeIndex = 0; writeIndex < descriptorWrites.size();
        ++writeIndex) {
@@ -465,41 +398,26 @@ void Renderer::updateMeshDescriptorSet() {
 
 void Renderer::updateRenderBucketDescriptorSet() {
   assert(_candidateMeshletCapacity > 0);
-  assert(_visibleMeshletCapacity > 0);
-  assert(_drawArgumentCapacity > 0);
-  assert(_meshletDrawMetaCapacity > 0);
   assert(_renderBucket.counterBuffer.buffer != VK_NULL_HANDLE);
 
-  std::array<VkDescriptorBufferInfo, 5> bufferInfos{{
+  std::array<VkDescriptorBufferInfo, 2> bufferInfos{{
       {
           .buffer = _renderBucket.candidateMeshletBuffer.buffer,
           .range = sizeof(MeshletInstance) * _candidateMeshletCapacity,
       },
       {
-          .buffer = _renderBucket.visibleMeshletBuffer.buffer,
-          .range = sizeof(MeshletInstance) * _visibleMeshletCapacity,
-      },
-      {
-          .buffer = _renderBucket.drawArgumentBuffer.buffer,
-          .range = sizeof(DrawIndirectCommand) * _drawArgumentCapacity,
-      },
-      {
           .buffer = _renderBucket.counterBuffer.buffer,
           .range = sizeof(RenderCounters),
       },
-      {
-          .buffer = _renderBucket.meshletDrawMetaBuffer.buffer,
-          .range = sizeof(MeshletDrawMeta) * _meshletDrawMetaCapacity,
-      },
   }};
 
-  std::array<VkWriteDescriptorSet, 5> descriptorWrites{};
+  std::array<VkWriteDescriptorSet, 2> descriptorWrites{};
   for (uint32_t writeIndex = 0; writeIndex < descriptorWrites.size();
        ++writeIndex) {
     descriptorWrites[writeIndex] = {
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .dstSet = _descriptorSet,
-        .dstBinding = 4 + writeIndex,
+        .dstBinding = 5 + writeIndex,
         .descriptorCount = 1,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .pBufferInfo = &bufferInfos[writeIndex],
@@ -569,10 +487,8 @@ void Renderer::rebuildMeshBuffers() {
 void Renderer::setObjects(const std::vector<Object3D> &objects) {
   _frameInstances.clear();
   _candidateMeshlets.clear();
-  _meshletDrawMetas.clear();
   uint64_t totalCandidateTriangles = 0;
   _frameInstances.reserve(objects.size());
-  std::vector<uint32_t> meshletCandidateCounts(_meshlets.size(), 0);
 
   for (const Object3D &object : objects) {
     assert(object.meshId < _meshes.size() && "invalid object mesh id");
@@ -590,25 +506,10 @@ void Renderer::setObjects(const std::vector<Object3D> &objects) {
           .instanceId = instanceId,
           .meshletId = meshletId,
       });
-      ++meshletCandidateCounts[meshletId];
       totalCandidateTriangles += triangleCount;
     }
   }
 
-  _meshletDrawMetas.resize(_meshlets.size());
-  uint32_t visibleInstanceOffset = 0;
-  for (uint32_t meshletId = 0; meshletId < _meshletDrawMetas.size();
-       ++meshletId) {
-    _meshletDrawMetas[meshletId] = {
-        .visibleInstanceOffset = visibleInstanceOffset,
-        .meshletId = meshletId,
-    };
-    visibleInstanceOffset += meshletCandidateCounts[meshletId];
-  }
-
-  _indirectDrawCount = _indirectMode == IndirectMode::MultiDraw
-                           ? static_cast<uint32_t>(_meshletDrawMetas.size())
-                           : (_candidateMeshlets.empty() ? 0u : 1u);
   _stats.totalMeshlets = static_cast<uint32_t>(_candidateMeshlets.size());
   _stats.totalTriangles = totalCandidateTriangles;
 
@@ -672,38 +573,6 @@ void Renderer::uploadRenderBucket() {
   bool recreated = uploadHostBuffer(
       _candidateMeshlets, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
       _renderBucket.candidateMeshletBuffer, _candidateMeshletCapacity);
-
-  recreated |= uploadHostBuffer(
-      _meshletDrawMetas, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-      _renderBucket.meshletDrawMetaBuffer, _meshletDrawMetaCapacity);
-
-  if (_candidateMeshlets.size() > _visibleMeshletCapacity) {
-    _vkContext.waitIdle();
-    _vkContext.destroyBuffer(_renderBucket.visibleMeshletBuffer);
-    _visibleMeshletCapacity = _candidateMeshlets.size();
-    _vkContext.createBuffer(sizeof(MeshletInstance) * _visibleMeshletCapacity,
-                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                            _renderBucket.visibleMeshletBuffer);
-    recreated = true;
-  }
-
-  const size_t requiredDrawArgumentCount =
-      _indirectMode == IndirectMode::MultiDraw
-          ? maxValue<size_t>(_meshletDrawMetas.size(), 1)
-          : 1;
-  if (requiredDrawArgumentCount > _drawArgumentCapacity) {
-    _vkContext.waitIdle();
-    _vkContext.destroyBuffer(_renderBucket.drawArgumentBuffer);
-    _drawArgumentCapacity = requiredDrawArgumentCount;
-    _vkContext.createBuffer(sizeof(DrawIndirectCommand) * _drawArgumentCapacity,
-                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
-                                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                            _renderBucket.drawArgumentBuffer);
-    recreated = true;
-  }
 
   if (_renderBucket.counterBuffer.buffer == VK_NULL_HANDLE) {
     _vkContext.createBuffer(
@@ -772,101 +641,38 @@ void Renderer::cleanupImgui() {
   _imguiDescriptorPool = VK_NULL_HANDLE;
 }
 
-void Renderer::recordComputeCull(VkCommandBuffer commandBuffer,
-                                 VkBuffer counterReadbackBuffer,
-                                 const CameraCullData &cullData) {
-  // reset buffers
+void Renderer::recordCounterReset(VkCommandBuffer commandBuffer) {
   vkCmdFillBuffer(commandBuffer, _renderBucket.counterBuffer.buffer, 0,
                   sizeof(RenderCounters), 0);
-  vkCmdFillBuffer(commandBuffer, _renderBucket.drawArgumentBuffer.buffer, 0,
-                  sizeof(DrawIndirectCommand) * _drawArgumentCapacity, 0);
 
-  std::array<VkBufferMemoryBarrier, 2> transferBarriers{{
-      {
-          .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-          .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-          .dstAccessMask =
-              VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-          .buffer = _renderBucket.counterBuffer.buffer,
-          .size = VK_WHOLE_SIZE,
-      },
-      {
-          .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-          .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-          .dstAccessMask =
-              VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-          .buffer = _renderBucket.drawArgumentBuffer.buffer,
-          .size = VK_WHOLE_SIZE,
-      },
-  }};
-
-  vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
-                       static_cast<uint32_t>(transferBarriers.size()),
-                       transferBarriers.data(), 0, nullptr);
-
-  vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                    _computePipeline);
-  vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                          _pipelineLayout, 0, 1, &_descriptorSet, 0, nullptr);
-
-  ComputePushConstants pushConstants{
-      .view = cullData.view,
-      .frustum = cullData.frustum,
-      .zNearFar = cullData.zNearFar,
-      .candidateCount = static_cast<uint32_t>(_candidateMeshlets.size()),
-      .mode = _indirectMode == IndirectMode::MultiDraw ? 1u : 0u,
-      .meshletDrawCount = static_cast<uint32_t>(_meshletDrawMetas.size()),
+  VkBufferMemoryBarrier barrier{
+      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .buffer = _renderBucket.counterBuffer.buffer,
+      .size = VK_WHOLE_SIZE,
   };
-  vkCmdPushConstants(commandBuffer, _pipelineLayout,
-                     VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
-                     0, sizeof(ComputePushConstants), &pushConstants);
+  vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_TASK_SHADER_BIT_EXT, 0, 0, nullptr, 1,
+                       &barrier, 0, nullptr);
+}
 
-  const uint32_t workItemCount =
-      maxValue(pushConstants.candidateCount, pushConstants.meshletDrawCount);
-  const uint32_t groupCount = (workItemCount + 63u) / 64u;
-  vkCmdDispatch(commandBuffer, groupCount, 1, 1);
-
-  std::array<VkBufferMemoryBarrier, 3> computeBarriers{{
-      {
-          .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-          .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-          .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-          .buffer = _renderBucket.visibleMeshletBuffer.buffer,
-          .size = VK_WHOLE_SIZE,
-      },
-      {
-          .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-          .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-          .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
-          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-          .buffer = _renderBucket.drawArgumentBuffer.buffer,
-          .size = VK_WHOLE_SIZE,
-      },
-      {
-          .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-          .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-          .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-          .buffer = _renderBucket.counterBuffer.buffer,
-          .size = VK_WHOLE_SIZE,
-      },
-  }};
-
-  vkCmdPipelineBarrier(
-      commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-      VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-          VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-      0, 0, nullptr, static_cast<uint32_t>(computeBarriers.size()),
-      computeBarriers.data(), 0, nullptr);
+void Renderer::recordCounterReadback(VkCommandBuffer commandBuffer,
+                                     VkBuffer counterReadbackBuffer) {
+  VkBufferMemoryBarrier shaderWriteBarrier{
+      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .buffer = _renderBucket.counterBuffer.buffer,
+      .size = VK_WHOLE_SIZE,
+  };
+  vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TASK_SHADER_BIT_EXT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1,
+                       &shaderWriteBarrier, 0, nullptr);
 
   VkBufferCopy counterCopy{
       .size = sizeof(RenderCounters),
@@ -883,7 +689,6 @@ void Renderer::recordComputeCull(VkCommandBuffer commandBuffer,
       .buffer = counterReadbackBuffer,
       .size = VK_WHOLE_SIZE,
   };
-
   vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
                        VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
                        &hostReadBarrier, 0, nullptr);
@@ -913,20 +718,6 @@ void Renderer::renderImgui(VkCommandBuffer commandBuffer, float dt) {
   ImGui::Text("rendered triangles: %s / %s", visibleTriangles.c_str(),
               totalTriangles.c_str());
 
-  const bool multiDrawSupported = _vkContext.supportsMultiDrawIndirect();
-  const char *modeName =
-      _indirectMode == IndirectMode::MultiDraw ? "MultiDraw" : "SingleDraw";
-  ImGui::Text("indirect mode: %s", modeName);
-  if (!multiDrawSupported) {
-    ImGui::TextDisabled("multiDrawIndirect unsupported");
-  }
-
-  const char *buttonLabel = _indirectMode == IndirectMode::MultiDraw
-                                ? "Switch to SingleDraw"
-                                : "Switch to MultiDraw";
-  if (ImGui::Button(buttonLabel)) {
-    _switchIndirectModeRequested = true;
-  }
   ImGui::End();
 
   ImGui::Render();
@@ -936,6 +727,7 @@ void Renderer::renderImgui(VkCommandBuffer commandBuffer, float dt) {
 void Renderer::recordRenderingCommands(VkCommandBuffer commandBuffer,
                                        const FrameContext &frame,
                                        const glm::mat4 &viewProjection,
+                                       const CameraCullData &cullData,
                                        float dt) {
   std::array<VkImageMemoryBarrier, 2> beginRenderingBarriers{{
       {
@@ -1010,17 +802,24 @@ void Renderer::recordRenderingCommands(VkCommandBuffer commandBuffer,
   vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                     _graphicsPipeline);
 
-  if (!_frameInstances.empty() && _indirectDrawCount > 0) {
+  if (!_candidateMeshlets.empty()) {
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                             _pipelineLayout, 0, 1, &_descriptorSet, 0, nullptr);
-    PushConstants pushConstants{
+    DrawPushConstants pushConstants{
         .viewProjection = viewProjection,
+        .view = cullData.view,
+        .frustum = cullData.frustum,
+        .zNearFar = cullData.zNearFar,
+        .candidateCount = static_cast<uint32_t>(_candidateMeshlets.size()),
     };
-    vkCmdPushConstants(commandBuffer, _pipelineLayout,
-                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
-                       0, sizeof(PushConstants), &pushConstants);
-    vkCmdDrawIndirect(commandBuffer, _renderBucket.drawArgumentBuffer.buffer, 0,
-                      _indirectDrawCount, sizeof(DrawIndirectCommand));
+    vkCmdPushConstants(commandBuffer, _pipelineLayout, kDrawStages, 0,
+                       sizeof(DrawPushConstants), &pushConstants);
+
+    const uint32_t groupCount =
+        (pushConstants.candidateCount + kTaskGroupSize - 1) / kTaskGroupSize;
+    _vkContext.cmdDrawMeshTasks(
+        commandBuffer, minValue(groupCount, kTaskGroupsPerRow),
+        (groupCount + kTaskGroupsPerRow - 1) / kTaskGroupsPerRow, 1);
   }
 
   renderImgui(commandBuffer, dt);
@@ -1060,10 +859,11 @@ void Renderer::recordCommandBuffer(const FrameContext &frame,
   assert(beginCommandBufferResult == VK_SUCCESS &&
          "failed to begin recording command buffer");
 
-  recordComputeCull(
+  recordCounterReset(commandBuffer);
+  recordRenderingCommands(commandBuffer, frame, viewProjection, cullData, dt);
+  recordCounterReadback(
       commandBuffer,
-      _renderBucket.counterReadbackBuffers[frame.frameIndex].buffer, cullData);
-  recordRenderingCommands(commandBuffer, frame, viewProjection, dt);
+      _renderBucket.counterReadbackBuffers[frame.frameIndex].buffer);
 
   const VkResult endCommandBufferResult = vkEndCommandBuffer(commandBuffer);
   assert(endCommandBufferResult == VK_SUCCESS &&
@@ -1072,14 +872,6 @@ void Renderer::recordCommandBuffer(const FrameContext &frame,
 
 void Renderer::render(const glm::mat4 &viewProjection,
                       const CameraCullData &cullData, float dt) {
-  if (_switchIndirectModeRequested) {
-    _switchIndirectModeRequested = false;
-    const IndirectMode nextMode = _indirectMode == IndirectMode::MultiDraw
-                                      ? IndirectMode::SingleDraw
-                                      : IndirectMode::MultiDraw;
-    setIndirectMode(nextMode);
-  }
-
   const FrameContext frame = _vkContext.beginFrame();
   readCompletedCounters(frame.frameIndex);
   recordCommandBuffer(frame, viewProjection, cullData, dt);

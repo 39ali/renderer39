@@ -15,6 +15,7 @@ const std::vector<const char *> kValidationLayers = {
 
 const std::vector<const char *> kDeviceExtensions = {
     VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+    VK_EXT_MESH_SHADER_EXTENSION_NAME,
 };
 
 #ifdef NDEBUG
@@ -372,27 +373,19 @@ void VkContext::createLogicalDevice() {
     queueCreateInfos.push_back(queueCreateInfo);
   }
 
-  VkPhysicalDeviceVulkan13Features supportedVulkan13Features{
-      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+  VkPhysicalDeviceMeshShaderFeaturesEXT meshShaderFeatures{
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT,
+      .taskShader = VK_TRUE,
+      .meshShader = VK_TRUE,
   };
-  VkPhysicalDeviceFeatures2 supportedFeatures{
-      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-      .pNext = &supportedVulkan13Features,
-  };
-  vkGetPhysicalDeviceFeatures2(_physicalDevice, &supportedFeatures);
-  assert(supportedVulkan13Features.dynamicRendering &&
-         "Vulkan 1.3 dynamic rendering is not supported");
-  _supportsMultiDrawIndirect =
-      supportedFeatures.features.multiDrawIndirect == VK_TRUE;
-
   VkPhysicalDeviceVulkan13Features vulkan13Features{
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+      .pNext = &meshShaderFeatures,
       .dynamicRendering = VK_TRUE,
   };
   VkPhysicalDeviceFeatures2 deviceFeatures{
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
       .pNext = &vulkan13Features,
-      .features = {.multiDrawIndirect = _supportsMultiDrawIndirect},
   };
   VkDeviceCreateInfo createInfo{
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
@@ -415,6 +408,10 @@ void VkContext::createLogicalDevice() {
                    &_graphicsQueue);
   vkGetDeviceQueue(_device, _queueFamilies.presentFamily.value(), 0,
                    &_presentQueue);
+
+  _vkCmdDrawMeshTasksEXT = reinterpret_cast<PFN_vkCmdDrawMeshTasksEXT>(
+      vkGetDeviceProcAddr(_device, "vkCmdDrawMeshTasksEXT"));
+  assert(_vkCmdDrawMeshTasksEXT && "vkCmdDrawMeshTasksEXT not available");
 }
 
 void VkContext::createAllocator() {

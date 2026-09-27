@@ -68,7 +68,11 @@ public:
   uint32_t swapChainImageCount() const {
     return static_cast<uint32_t>(_swapChainImages.size());
   }
-  bool supportsMultiDrawIndirect() const { return _supportsMultiDrawIndirect; }
+  void cmdDrawMeshTasks(VkCommandBuffer commandBuffer, uint32_t groupCountX,
+                       uint32_t groupCountY, uint32_t groupCountZ) const {
+    _vkCmdDrawMeshTasksEXT(commandBuffer, groupCountX, groupCountY,
+                           groupCountZ);
+  }
 
 private:
   struct QueueFamilyIndices {
@@ -149,7 +153,8 @@ private:
   std::vector<VkSemaphore> _renderFinishedSemaphores;
   std::vector<VkFence> _inFlightFences;
   size_t _currentFrame = 0;
-  bool _supportsMultiDrawIndirect = false;
+  // extension entry points are not exported by the loader
+  PFN_vkCmdDrawMeshTasksEXT _vkCmdDrawMeshTasksEXT = nullptr;
 
 public:
   GLFWwindow *_window = nullptr;

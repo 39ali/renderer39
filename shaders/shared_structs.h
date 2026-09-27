@@ -10,13 +10,24 @@
 using uint = std::uint32_t;
 using vec2 = glm::vec2;
 using vec4 = glm::vec4;
+using mat4 = glm::mat4;
 #define SHARED_INLINE inline
 #else
 // HLSL
 typedef float2 vec2;
 typedef float4 vec4;
+typedef float4x4 mat4;
 #define SHARED_INLINE
 #endif
+
+static const uint kMaxMeshletVertices = 64u;
+static const uint kMaxMeshletTriangles = 124u;
+// one task shader invocation per candidate meshlet; must equal the wave size
+// (32 on NVIDIA) because the task shader compacts with wave intrinsics.
+static const uint kTaskGroupSize = 32u;
+// task workgroups are laid out as a 2D grid so large scenes stay under
+// maxTaskWorkGroupCount[0].
+static const uint kTaskGroupsPerRow = 65535u;
 
 // 48 bytes
 struct InstanceData {
@@ -50,17 +61,30 @@ struct MeshletInstance {
   uint meshletId;
 };
 
-struct MeshletDrawMeta {
-  uint visibleInstanceOffset;
-  uint meshletId;
+struct RenderCounters {
+  uint visibleMeshletCount;
+  uint visibleTriangleCount;
 };
 
-struct DrawIndirectCommand {
-  uint vertexCount;
-  uint instanceCount;
-  uint firstVertex;
-  uint firstInstance;
+// shared by the task and mesh stages.
+struct DrawPushConstants {
+  mat4 viewProjection;
+  mat4 view;
+  vec4 frustum;
+  vec2 zNearFar;
+  uint candidateCount;
+  uint padding;
 };
+
+SHARED_INLINE uint meshletVertexCount(
+#ifdef __cplusplus
+    const Meshlet &meshlet
+#else
+    Meshlet meshlet
+#endif
+) {
+  return meshlet.packedCountsAndFlags & 0xffu;
+}
 
 SHARED_INLINE uint meshletTriangleCount(
 #ifdef __cplusplus
@@ -73,8 +97,9 @@ SHARED_INLINE uint meshletTriangleCount(
 }
 
 #ifndef __cplusplus
-static const uint kMaxMeshletTriangles = 124u;
-static const uint kSyntheticIndicesPerMeshlet = kMaxMeshletTriangles * 3u;
+struct TaskPayload {
+  MeshletInstance meshlets[kTaskGroupSize];
+};
 
 float2 unpackHalf2x16(uint packed) {
   return float2(f16tof32(packed), f16tof32(packed >> 16u));
@@ -122,8 +147,13 @@ static_assert(offsetof(Meshlet, boundingCone) == 20);
 
 static_assert(sizeof(MeshletVertex) == 12);
 static_assert(sizeof(MeshletInstance) == 8);
-static_assert(sizeof(MeshletDrawMeta) == 8);
-static_assert(sizeof(DrawIndirectCommand) == 16);
+static_assert(sizeof(RenderCounters) == 8);
+
+static_assert(sizeof(DrawPushConstants) == 160);
+static_assert(offsetof(DrawPushConstants, view) == 64);
+static_assert(offsetof(DrawPushConstants, frustum) == 128);
+static_assert(offsetof(DrawPushConstants, zNearFar) == 144);
+static_assert(offsetof(DrawPushConstants, candidateCount) == 152);
 #endif
 
 #undef SHARED_INLINE

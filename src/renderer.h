@@ -15,21 +15,11 @@ struct MeshUploadInfo {
   uint32_t meshletCount = 0;
 };
 
-struct RenderCounters {
-  uint32_t visibleMeshletCount = 0;
-  uint32_t visibleTriangleCount = 0;
-};
-
 struct RenderBucket {
   Buffer<MeshletInstance> candidateMeshletBuffer;
-  Buffer<MeshletInstance> visibleMeshletBuffer;
-  Buffer<DrawIndirectCommand> drawArgumentBuffer;
   Buffer<RenderCounters> counterBuffer;
-  Buffer<MeshletDrawMeta> meshletDrawMetaBuffer;
   Buffer<RenderCounters> counterReadbackBuffers[VkContext::kMaxFramesInFlight];
 };
-
-enum class IndirectMode { SingleDraw, MultiDraw };
 
 struct RenderStats {
   uint32_t visibleMeshlets = 0;
@@ -54,11 +44,9 @@ public:
   void waitIdle();
 
 private:
-  void setIndirectMode(IndirectMode mode);
   void cleanup();
   void createDescriptorSetLayout();
   void createGraphicsPipeline();
-  void createCullingPipeline();
   void createImgui();
   void createDescriptorPool();
   void createDescriptorSet();
@@ -77,12 +65,13 @@ private:
   void recordCommandBuffer(const FrameContext &frame,
                            const glm::mat4 &viewProjection,
                            const CameraCullData &cullData, float dt);
-  void recordComputeCull(VkCommandBuffer commandBuffer,
-                         VkBuffer counterReadbackBuffer,
-                         const CameraCullData &cullData);
+  void recordCounterReset(VkCommandBuffer commandBuffer);
+  void recordCounterReadback(VkCommandBuffer commandBuffer,
+                             VkBuffer counterReadbackBuffer);
   void recordRenderingCommands(VkCommandBuffer commandBuffer,
                                const FrameContext &frame,
-                               const glm::mat4 &viewProjection, float dt);
+                               const glm::mat4 &viewProjection,
+                               const CameraCullData &cullData, float dt);
   void renderImgui(VkCommandBuffer commandBuffer, float dt);
   void cleanupImgui();
 
@@ -95,14 +84,10 @@ private:
   std::vector<MeshUploadInfo> _meshes;
   std::vector<InstanceData> _frameInstances;
   std::vector<MeshletInstance> _candidateMeshlets;
-  std::vector<MeshletDrawMeta> _meshletDrawMetas;
-  uint32_t _indirectDrawCount = 0;
 
-  IndirectMode _indirectMode = IndirectMode::MultiDraw;
   VkDescriptorSetLayout _descriptorSetLayout = VK_NULL_HANDLE;
   VkPipelineLayout _pipelineLayout = VK_NULL_HANDLE;
   VkPipeline _graphicsPipeline = VK_NULL_HANDLE;
-  VkPipeline _computePipeline = VK_NULL_HANDLE;
   VkDescriptorPool _descriptorPool = VK_NULL_HANDLE;
   VkDescriptorPool _imguiDescriptorPool = VK_NULL_HANDLE;
   VkDescriptorSet _descriptorSet = VK_NULL_HANDLE;
@@ -114,9 +99,5 @@ private:
   RenderBucket _renderBucket;
   size_t _instanceBufferCapacity = 0;
   size_t _candidateMeshletCapacity = 0;
-  size_t _visibleMeshletCapacity = 0;
-  size_t _drawArgumentCapacity = 0;
-  size_t _meshletDrawMetaCapacity = 0;
   RenderStats _stats;
-  bool _switchIndirectModeRequested = false;
 };

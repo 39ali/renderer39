@@ -58,7 +58,7 @@ float4 main(VertexOutput input) : SV_Target0 {
       material.occlusionStrength *
           (sampleTexture(material.occlusionTexture, input.uv, 1.0).r - 1.0);
   const float3 emissive =
-      material.emissiveFactor *
+      material.emissiveFactor * pc.emissiveIntensity *
       sampleTexture(material.emissiveTexture, input.uv, 1.0).rgb;
 
   switch (pc.debugView) {

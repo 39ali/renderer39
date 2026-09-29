@@ -122,6 +122,17 @@ struct EnvironmentAliasEntry {
   uint padding;
 };
 
+// one entry of the emissive-triangle alias table; entries are picked with
+// probability weight / emissiveTotalWeight, weight = world area * emission.
+struct EmissiveLight {
+  // chance of keeping this entry instead of `alias`
+  float probability;
+  uint alias;
+  uint instanceId;
+  // triangle within the instance's mesh, like a ray query primitive index
+  uint primitiveIndex;
+};
+
 struct MeshletInstance {
   uint instanceId;
   uint meshletId;
@@ -155,6 +166,12 @@ struct DrawPushConstants {
   uint environmentTableHeight;
   // 1: sample the environment directly and combine with BRDF sampling (MIS)
   uint environmentSampling;
+  uint emissiveLightCount;
+  float emissiveTotalWeight;
+  // 1: sample emissive triangles directly and combine with BRDF sampling (MIS)
+  uint emissiveSampling;
+  // multiplies every material's emission
+  float emissiveIntensity;
 };
 
 SHARED_INLINE uint meshletVertexCount(
@@ -243,9 +260,11 @@ static_assert(offsetof(Material, alphaMode) == 68);
 
 static_assert(sizeof(MeshletInstance) == 8);
 static_assert(sizeof(EnvironmentAliasEntry) == 16);
+static_assert(sizeof(EmissiveLight) == 16);
 static_assert(sizeof(RenderCounters) == 8);
 
-static_assert(sizeof(DrawPushConstants) == 224);
+static_assert(sizeof(DrawPushConstants) == 240);
+static_assert(offsetof(DrawPushConstants, emissiveLightCount) == 224);
 static_assert(offsetof(DrawPushConstants, sampleIndex) == 204);
 static_assert(offsetof(DrawPushConstants, maxBounces) == 208);
 static_assert(offsetof(DrawPushConstants, environmentTexture) == 192);

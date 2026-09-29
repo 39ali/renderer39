@@ -23,6 +23,10 @@
 // meshlet id of every triangle, in meshletTriangles order
 [[vk::binding(13, 0)]] StructuredBuffer<uint> triangleMeshlets;
 [[vk::binding(14, 0)]] StructuredBuffer<EnvironmentAliasEntry> environmentAlias;
+[[vk::binding(15, 0)]] StructuredBuffer<EmissiveLight> emissiveLights;
+// estimated emitted luminance of every triangle (0 if not emissive), in
+// meshletTriangles order; a light's weight is this times its world area
+[[vk::binding(16, 0)]] StructuredBuffer<float> triangleEmission;
 
 // the mesh shader output and fragment shader input
 struct VertexOutput {

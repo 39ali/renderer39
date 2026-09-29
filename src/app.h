@@ -13,7 +13,8 @@ class Renderer;
 
 class App {
 public:
-  App(std::filesystem::path appDir);
+  // scene: a single glTF to show instead of the default models (optional)
+  App(std::filesystem::path appDir, std::filesystem::path scene = {});
   ~App();
   void run();
   void setRenderMode(RenderMode mode);
@@ -23,7 +24,7 @@ public:
 
 private:
   void initWindow();
-  void initScene();
+  void initScene(const std::filesystem::path &scene);
 
   Resources _resources;
   std::vector<Object3D> _objects;

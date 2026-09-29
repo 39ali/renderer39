@@ -12,12 +12,13 @@
 constexpr uint32_t kWidth = 1920 * 1.5;
 constexpr uint32_t kHeight = 1080 * 1.5;
 
-App::App(std::filesystem::path appDir) : _resources(appDir) {
+App::App(std::filesystem::path appDir, std::filesystem::path scene)
+    : _resources(appDir) {
 
   initWindow();
   _renderer = std::make_unique<Renderer>(_window, appDir);
   _renderer->init();
-  initScene();
+  initScene(scene);
 }
 
 App::~App() {
@@ -39,21 +40,24 @@ void App::initWindow() {
   assert(_window && "failed to create GLFW window");
 }
 
-void App::initScene() {
+void App::initScene(const std::filesystem::path &scene) {
   struct SceneModel {
-    const char *path;
+    std::filesystem::path path;
     glm::vec3 position;
   };
   // each model is scaled to a bounding radius of 1 and placed on the X axis
-  const SceneModel sceneModels[] = {
+  std::vector<SceneModel> sceneModels = {
       {"assets/DamagedHelmet.glb", {0.0f, 0.0f, 0.0f}},
       {"assets/Duck.glb", {2.5f, 0.0f, 0.0f}},
       {"assets/kitten.glb", {-2.5f, 0.0f, 0.0f}},
   };
+  if (!scene.empty()) {
+    sceneModels = {{scene, {0.0f, 0.0f, 0.0f}}};
+  }
 
   for (const SceneModel &sceneModel : sceneModels) {
     const GltfModel model = _resources.loadGltfModel(sceneModel.path);
-    std::cout << sceneModel.path << ": " << model.meshlets.size()
+    std::cout << sceneModel.path.string() << ": " << model.meshlets.size()
               << " meshlets, " << model.meshletTriangles.size()
               << " triangles, "
               << model.materials.size() << " materials, "
@@ -70,7 +74,9 @@ void App::initScene() {
   _renderer->setEnvironment(
       _resources.loadHdrImage("assets/photo_studio_loft_hall_2k.hdr"));
 
-  _camera.lookAt(glm::vec3{0.0f, 0.5f, 5.0f}, glm::vec3{0.0f});
+  const glm::vec3 cameraPosition =
+      scene.empty() ? glm::vec3{0.0f, 0.5f, 5.0f} : glm::vec3{0.0f, 0.0f, 2.6f};
+  _camera.lookAt(cameraPosition, glm::vec3{0.0f});
   _renderer->setObjects(_objects);
 }
 

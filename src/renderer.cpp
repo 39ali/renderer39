@@ -37,10 +37,12 @@ enum Binding : uint32_t {
   kBindingAccumulation = 12,
   kBindingTriangleMeshlets = 13,
   kBindingEnvironmentAlias = 14,
-  kBindingCount = 15,
+  kBindingEmissiveLights = 15,
+  kBindingTriangleEmission = 16,
+  kBindingCount = 17,
 };
-// bindings 0..8, kBindingTriangleMeshlets and kBindingEnvironmentAlias
-constexpr uint32_t kStorageBufferBindingCount = 11;
+// bindings 0..8 and 13..16
+constexpr uint32_t kStorageBufferBindingCount = 13;
 // the environment alias table is built from the HDR shrunk to at most this
 // width; windows and other small lights stay resolved at 512x256.
 constexpr uint32_t kEnvironmentTableMaxWidth = 512;
@@ -150,6 +152,83 @@ buildEnvironmentAliasTable(const HdrImage &image, uint32_t &tableWidth,
   return buildAliasTable(weights);
 }
 
+float srgbToLinear(uint8_t value) {
+  const float c = value / 255.0f;
+  return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
+
+float luminance(const glm::vec3 &color) {
+  return glm::dot(color, glm::vec3(0.2126f, 0.7152f, 0.0722f));
+}
+
+// Average emitted luminance of every triangle in meshletTriangles order,
+// estimated from 16 texture lookups per triangle. Triangles of an emissive
+// material never drop below a small floor: light sampling must be able to
+// pick anything that might emit, or its estimate would be biased.
+std::vector<float> estimateTriangleEmission(const GltfModel &model) {
+  std::vector<float> emission;
+  emission.reserve(model.meshletTriangles.size());
+  for (const Meshlet &meshlet : model.meshlets) {
+    const Material &material = model.materials[meshlet.materialIndex];
+    const float factor = luminance(material.emissiveFactor);
+    for (uint32_t t = 0; t < meshletTriangleCount(meshlet); ++t) {
+      if (factor <= 0.0f) {
+        emission.push_back(0.0f);
+        continue;
+      }
+      if (material.emissiveTexture == kInvalidTexture) {
+        emission.push_back(factor);
+        continue;
+      }
+
+      const TextureData &texture = model.textures[material.emissiveTexture];
+      const uint32_t packed =
+          model.meshletTriangles[meshlet.triangleOffset + t];
+      glm::vec2 uv[3];
+      for (uint32_t corner = 0; corner < 3; ++corner) {
+        const uint32_t local = (packed >> (corner * 10u)) & 0x3ffu;
+        uv[corner] = model.attributes[model.meshletVertexRefs
+                                          [meshlet.vertexOffset + local]]
+                         .uv;
+      }
+
+      constexpr int kGrid = 4;
+      float sum = 0.0f;
+      for (int i = 0; i < kGrid; ++i) {
+        for (int j = 0; j < kGrid; ++j) {
+          // stratified uniform barycentrics
+          const float rootU = std::sqrt((i + 0.5f) / kGrid);
+          const float v = (j + 0.5f) / kGrid;
+          const glm::vec3 w{1.0f - rootU, rootU * (1.0f - v), rootU * v};
+          const glm::vec2 p = uv[0] * w.x + uv[1] * w.y + uv[2] * w.z;
+          const uint32_t x = std::min(
+              static_cast<uint32_t>((p.x - std::floor(p.x)) * texture.width),
+              texture.width - 1);
+          const uint32_t y = std::min(
+              static_cast<uint32_t>((p.y - std::floor(p.y)) * texture.height),
+              texture.height - 1);
+          const uint8_t *texel =
+              &texture.rgba[(size_t{y} * texture.width + x) * 4];
+          const glm::vec3 color =
+              texture.srgb
+                  ? glm::vec3(srgbToLinear(texel[0]), srgbToLinear(texel[1]),
+                              srgbToLinear(texel[2]))
+                  : glm::vec3(texel[0], texel[1], texel[2]) / 255.0f;
+          sum += luminance(material.emissiveFactor * color);
+        }
+      }
+      emission.push_back(std::max(sum / (kGrid * kGrid), factor * 1e-3f));
+    }
+  }
+  return emission;
+}
+
+glm::mat4 objectTransform(const Object3D &object) {
+  return glm::translate(glm::mat4(1.0f), object.position) *
+         glm::mat4_cast(object.rotation) *
+         glm::scale(glm::mat4(1.0f), object.scale);
+}
+
 InstanceData makeInstanceData(const Object3D &object,
                               const MeshUploadInfo &mesh) {
   return {
@@ -177,11 +256,16 @@ void Renderer::init() {
   createDescriptorPool();
   createDescriptorSet();
   createSampler();
-  // placeholder until setEnvironment; keeps the binding valid
+  // placeholders until an environment / objects exist; keep bindings valid
   uploadDeviceLocalBuffer(std::vector<EnvironmentAliasEntry>(1),
                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                           _environmentAliasBuffer);
   writeEnvironmentAliasDescriptor();
+  uploadDeviceLocalBuffer(std::vector<EmissiveLight>(1),
+                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                          _emissiveLightBuffer);
+  writeStorageBufferDescriptor(kBindingEmissiveLights,
+                               _emissiveLightBuffer.buffer);
 
   const RenderTargetInfo renderTarget = _vkContext.renderTargetInfo();
   _accumulationImage = _vkContext.createStorageImage(
@@ -227,6 +311,8 @@ void Renderer::cleanup() {
     _vkContext.destroyBuffer(_meshletTriangleBuffer);
     _vkContext.destroyBuffer(_triangleMeshletBuffer);
     _vkContext.destroyBuffer(_environmentAliasBuffer);
+    _vkContext.destroyBuffer(_emissiveLightBuffer);
+    _vkContext.destroyBuffer(_triangleEmissionBuffer);
     _vkContext.destroyTexture(_accumulationImage);
     _rayTracingScene.destroy();
     _vkContext.destroyBuffer(_meshletVertexRefBuffer);
@@ -266,12 +352,16 @@ void Renderer::createDescriptorSetLayout() {
       .descriptorCount = 1,
       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
   };
-  bindings[kBindingEnvironmentAlias] = {
-      .binding = kBindingEnvironmentAlias,
-      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-      .descriptorCount = 1,
-      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-  };
+  for (const Binding binding : {kBindingEnvironmentAlias,
+                                 kBindingEmissiveLights,
+                                 kBindingTriangleEmission}) {
+    bindings[binding] = {
+        .binding = binding,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+    };
+  }
   bindings[kBindingTlas] = {
       .binding = kBindingTlas,
       .descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
@@ -670,7 +760,10 @@ void Renderer::updateInstanceDescriptorSet() {
 }
 
 void Renderer::updateMeshDescriptorSet() {
-  const std::array<std::pair<Binding, VkDescriptorBufferInfo>, 7> buffers{{
+  const std::array<std::pair<Binding, VkDescriptorBufferInfo>, 8> buffers{{
+      {kBindingTriangleEmission,
+       {.buffer = _triangleEmissionBuffer.buffer,
+        .range = sizeof(float) * _triangleEmission.size()}},
       {kBindingTriangleMeshlets,
        {.buffer = _triangleMeshletBuffer.buffer,
         .range = sizeof(uint32_t) * _triangleMeshlets.size()}},
@@ -775,6 +868,10 @@ MeshId Renderer::loadModel(const GltfModel &model) {
   const uint32_t meshletTriangleBase =
       static_cast<uint32_t>(_meshletTriangles.size());
   info.firstTriangle = meshletTriangleBase;
+  info.triangleCount = static_cast<uint32_t>(model.meshletTriangles.size());
+  const std::vector<float> emission = estimateTriangleEmission(model);
+  _triangleEmission.insert(_triangleEmission.end(), emission.begin(),
+                           emission.end());
   const uint32_t materialBase = static_cast<uint32_t>(_materials.size());
   const uint32_t textureBase = static_cast<uint32_t>(_textures.size());
   assert(textureBase + model.textures.size() <= kMaxTextures);
@@ -902,6 +999,10 @@ void Renderer::saveAccumulation(const std::filesystem::path &path) {
   }
   vmaUnmapMemory(_vkContext.allocator(), readback.allocation);
   _vkContext.destroyBuffer(readback);
+  if (!file) {
+    std::cerr << "failed to write " << path.string() << std::endl;
+    return;
+  }
   std::cout << "saved " << _sampleIndex << " samples to " << path.string()
             << std::endl;
 }
@@ -959,6 +1060,8 @@ void Renderer::rebuildMeshBuffers() {
       _vertexPositionBuffer);
   uploadDeviceLocalBuffer(_triangleMeshlets, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                           _triangleMeshletBuffer);
+  uploadDeviceLocalBuffer(_triangleEmission, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                          _triangleEmissionBuffer);
   uploadDeviceLocalBuffer(_vertexAttributes,
                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                           _vertexAttributeBuffer);
@@ -1033,10 +1136,7 @@ void Renderer::setObjects(const std::vector<Object3D> &objects) {
   tlasInstances.reserve(objects.size());
   for (size_t i = 0; i < objects.size(); ++i) {
     const Object3D &object = objects[i];
-    const glm::mat4 transform =
-        glm::translate(glm::mat4(1.0f), object.position) *
-        glm::mat4_cast(object.rotation) *
-        glm::scale(glm::mat4(1.0f), object.scale);
+    const glm::mat4 transform = objectTransform(object);
     VkTransformMatrixKHR matrix{};
     for (int row = 0; row < 3; ++row) {
       for (int column = 0; column < 4; ++column) {
@@ -1072,7 +1172,86 @@ void Renderer::setObjects(const std::vector<Object3D> &objects) {
       .descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
   };
   vkUpdateDescriptorSets(_vkContext.device(), 1, &tlasWrite, 0, nullptr);
+  buildEmissiveLights(objects);
   _sampleIndex = 0;
+}
+
+void Renderer::buildEmissiveLights(const std::vector<Object3D> &objects) {
+  // weight = world area * estimated emission; must match the path tracer's
+  // hit.lightWeight so MIS weights agree
+  std::vector<double> weights;
+  std::vector<EmissiveLight> lights;
+  for (uint32_t instanceId = 0; instanceId < objects.size(); ++instanceId) {
+    const Object3D &object = objects[instanceId];
+    const MeshUploadInfo &mesh = _meshes[object.meshId];
+    const glm::mat4 transform = objectTransform(object);
+    for (uint32_t meshletId = mesh.firstMeshlet;
+         meshletId < mesh.firstMeshlet + mesh.meshletCount; ++meshletId) {
+      const Meshlet &meshlet = _meshlets[meshletId];
+      for (uint32_t t = 0; t < meshletTriangleCount(meshlet); ++t) {
+        const uint32_t triangleIndex = meshlet.triangleOffset + t;
+        const float emission = _triangleEmission[triangleIndex];
+        if (emission <= 0.0f) {
+          continue;
+        }
+        const uint32_t packed = _meshletTriangles[triangleIndex];
+        glm::vec3 p[3];
+        for (uint32_t corner = 0; corner < 3; ++corner) {
+          const uint32_t local = (packed >> (corner * 10u)) & 0x3ffu;
+          const VertexPosition &position =
+              _vertexPositions[_meshletVertexRefs[meshlet.vertexOffset + local]];
+          p[corner] = glm::vec3(
+              transform * glm::vec4(position.x, position.y, position.z, 1.0f));
+        }
+        const float area =
+            0.5f * glm::length(glm::cross(p[1] - p[0], p[2] - p[0]));
+        if (area <= 0.0f) {
+          continue;
+        }
+        weights.push_back(double{emission} * area);
+        lights.push_back({
+            .instanceId = instanceId,
+            .primitiveIndex = triangleIndex - mesh.firstTriangle,
+        });
+      }
+    }
+  }
+
+  _emissiveLightCount = static_cast<uint32_t>(lights.size());
+  _emissiveTotalWeight = static_cast<float>(
+      std::accumulate(weights.begin(), weights.end(), 0.0));
+  if (lights.empty()) {
+    return;
+  }
+  const std::vector<EnvironmentAliasEntry> table = buildAliasTable(weights);
+  for (size_t i = 0; i < lights.size(); ++i) {
+    lights[i].probability = table[i].probability;
+    lights[i].alias = table[i].alias;
+  }
+  _vkContext.waitIdle();
+  uploadDeviceLocalBuffer(lights, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                          _emissiveLightBuffer);
+  writeStorageBufferDescriptor(kBindingEmissiveLights,
+                               _emissiveLightBuffer.buffer);
+  std::cout << "emissive lights: " << _emissiveLightCount << " triangles"
+            << std::endl;
+}
+
+void Renderer::writeStorageBufferDescriptor(uint32_t binding,
+                                            VkBuffer buffer) {
+  VkDescriptorBufferInfo bufferInfo{
+      .buffer = buffer,
+      .range = VK_WHOLE_SIZE,
+  };
+  VkWriteDescriptorSet descriptorWrite{
+      .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+      .dstSet = _descriptorSet,
+      .dstBinding = binding,
+      .descriptorCount = 1,
+      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+      .pBufferInfo = &bufferInfo,
+  };
+  vkUpdateDescriptorSets(_vkContext.device(), 1, &descriptorWrite, 0, nullptr);
 }
 
 template <typename T>
@@ -1263,6 +1442,8 @@ void Renderer::renderImgui(VkCommandBuffer commandBuffer, float dt) {
     ImGui::SetNextItemWidth(160.0f);
     ImGui::SliderInt("max bounces", &_maxBounces, 0, 16);
     ImGui::Checkbox("environment sampling (MIS)", &_environmentSampling);
+    ImGui::Checkbox("emissive light sampling (MIS)", &_emissiveSampling);
+    ImGui::Text("emissive lights: %u", _emissiveLightCount);
   }
   int debugView = static_cast<int>(_debugView);
   ImGui::SetNextItemWidth(160.0f);
@@ -1278,6 +1459,9 @@ void Renderer::renderImgui(VkCommandBuffer commandBuffer, float dt) {
   ImGui::SliderFloat("light intensity", &_lightIntensity, 0.0f, 10.0f);
   ImGui::SetNextItemWidth(160.0f);
   ImGui::SliderFloat("environment", &_environmentIntensity, 0.0f, 4.0f);
+  ImGui::SetNextItemWidth(160.0f);
+  ImGui::SliderFloat("emissive", &_emissiveIntensity, 0.0f, 100.0f, "%.1f",
+                     ImGuiSliderFlags_Logarithmic);
 
   ImGui::End();
 
@@ -1485,6 +1669,10 @@ Renderer::makePushConstants(const glm::mat4 &viewProjection,
       .environmentTableWidth = _environmentTableWidth,
       .environmentTableHeight = _environmentTableHeight,
       .environmentSampling = _environmentSampling ? 1u : 0u,
+      .emissiveLightCount = _emissiveLightCount,
+      .emissiveTotalWeight = _emissiveTotalWeight,
+      .emissiveSampling = _emissiveSampling ? 1u : 0u,
+      .emissiveIntensity = _emissiveIntensity,
   };
 }
 

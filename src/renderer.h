@@ -16,6 +16,7 @@ struct MeshUploadInfo {
   uint32_t meshletCount = 0;
   // into _meshletTriangles; also the base of ray tracing primitive indices
   uint32_t firstTriangle = 0;
+  uint32_t triangleCount = 0;
 };
 
 enum class RenderMode { Raster, PathTracing };
@@ -50,6 +51,12 @@ public:
   void waitIdle();
   void setRenderMode(RenderMode mode) { _renderMode = mode; }
   void setEnvironmentSampling(bool enabled) { _environmentSampling = enabled; }
+  void setEmissiveSampling(bool enabled) { _emissiveSampling = enabled; }
+  void setEmissiveIntensity(float intensity) { _emissiveIntensity = intensity; }
+  void setLightIntensity(float intensity) { _lightIntensity = intensity; }
+  void setEnvironmentIntensity(float intensity) {
+    _environmentIntensity = intensity;
+  }
   // path tracing stops accumulating after this many samples (0: never)
   void setMaxSamples(uint32_t samples) { _maxSamples = samples; }
   // true once path tracing has reached its sample limit
@@ -76,6 +83,8 @@ private:
   void updateMeshDescriptorSet();
   void createSampler();
   void writeEnvironmentAliasDescriptor();
+  void writeStorageBufferDescriptor(uint32_t binding, VkBuffer buffer);
+  void buildEmissiveLights(const std::vector<Object3D> &objects);
   void uploadTextures(const std::vector<TextureData> &textures);
   void updateRenderBucketDescriptorSet();
   void rebuildMeshBuffers();
@@ -105,6 +114,8 @@ private:
   std::vector<uint32_t> _meshletTriangles;
   // meshlet of every triangle in _meshletTriangles
   std::vector<uint32_t> _triangleMeshlets;
+  // estimated emitted luminance of every triangle in _meshletTriangles
+  std::vector<float> _triangleEmission;
   std::vector<Material> _materials;
   std::vector<Texture> _textures;
   std::vector<MeshUploadInfo> _meshes;
@@ -128,6 +139,12 @@ private:
   Buffer<uint32_t> _triangleMeshletBuffer;
   Buffer<Material> _materialBuffer;
   Buffer<EnvironmentAliasEntry> _environmentAliasBuffer;
+  Buffer<float> _triangleEmissionBuffer;
+  Buffer<EmissiveLight> _emissiveLightBuffer;
+  uint32_t _emissiveLightCount = 0;
+  float _emissiveTotalWeight = 0.0f;
+  bool _emissiveSampling = true;
+  float _emissiveIntensity = 1.0f;
   uint32_t _environmentTableWidth = 0;
   uint32_t _environmentTableHeight = 0;
   bool _environmentSampling = true;

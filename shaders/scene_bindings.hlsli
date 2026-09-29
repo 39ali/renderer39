@@ -22,6 +22,7 @@
 [[vk::binding(12, 0)]] RWTexture2D<float4> accumulation;
 // meshlet id of every triangle, in meshletTriangles order
 [[vk::binding(13, 0)]] StructuredBuffer<uint> triangleMeshlets;
+[[vk::binding(14, 0)]] StructuredBuffer<EnvironmentAliasEntry> environmentAlias;
 
 // the mesh shader output and fragment shader input
 struct VertexOutput {

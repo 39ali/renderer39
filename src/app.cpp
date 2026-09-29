@@ -88,6 +88,11 @@ void App::run() {
     _camera.update(_window, dt);
     _renderer->render(_camera.viewProjectionMatrix(), _camera.cullData(), dt);
     glfwPollEvents();
+
+    if (!_dumpPath.empty() && _renderer->accumulationComplete()) {
+      _renderer->saveAccumulation(_dumpPath);
+      break;
+    }
   }
   _renderer->waitIdle();
 }

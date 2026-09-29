@@ -111,6 +111,17 @@ struct Material {
   uint padding1;
 };
 
+// one entry of the environment map's alias table (Vose's method); the table
+// is a downsampled copy of the HDR, one entry per texel, row-major.
+struct EnvironmentAliasEntry {
+  // chance of keeping this texel instead of `alias`
+  float probability;
+  uint alias;
+  // density of this texel over the [0,1]^2 equirect square
+  float pdf;
+  uint padding;
+};
+
 struct MeshletInstance {
   uint instanceId;
   uint meshletId;
@@ -139,9 +150,11 @@ struct DrawPushConstants {
   // path tracer: samples accumulated so far (0 restarts accumulation)
   uint sampleIndex;
   uint maxBounces;
-  uint padding2;
-  uint padding3;
-  uint padding4;
+  // size of the environment alias table (0 when there is none)
+  uint environmentTableWidth;
+  uint environmentTableHeight;
+  // 1: sample the environment directly and combine with BRDF sampling (MIS)
+  uint environmentSampling;
 };
 
 SHARED_INLINE uint meshletVertexCount(
@@ -229,6 +242,7 @@ static_assert(offsetof(Material, baseColorTexture) == 48);
 static_assert(offsetof(Material, alphaMode) == 68);
 
 static_assert(sizeof(MeshletInstance) == 8);
+static_assert(sizeof(EnvironmentAliasEntry) == 16);
 static_assert(sizeof(RenderCounters) == 8);
 
 static_assert(sizeof(DrawPushConstants) == 224);

@@ -49,6 +49,16 @@ public:
               float dt);
   void waitIdle();
   void setRenderMode(RenderMode mode) { _renderMode = mode; }
+  void setEnvironmentSampling(bool enabled) { _environmentSampling = enabled; }
+  // path tracing stops accumulating after this many samples (0: never)
+  void setMaxSamples(uint32_t samples) { _maxSamples = samples; }
+  // true once path tracing has reached its sample limit
+  bool accumulationComplete() const {
+    return _renderMode == RenderMode::PathTracing && _maxSamples > 0 &&
+           _sampleIndex >= _maxSamples;
+  }
+  // writes the path tracer's linear radiance as a PFM image
+  void saveAccumulation(const std::filesystem::path &path);
 
 private:
   void cleanup();
@@ -65,6 +75,7 @@ private:
   void updateInstanceDescriptorSet();
   void updateMeshDescriptorSet();
   void createSampler();
+  void writeEnvironmentAliasDescriptor();
   void uploadTextures(const std::vector<TextureData> &textures);
   void updateRenderBucketDescriptorSet();
   void rebuildMeshBuffers();
@@ -116,6 +127,11 @@ private:
   Buffer<uint32_t> _meshletTriangleBuffer;
   Buffer<uint32_t> _triangleMeshletBuffer;
   Buffer<Material> _materialBuffer;
+  Buffer<EnvironmentAliasEntry> _environmentAliasBuffer;
+  uint32_t _environmentTableWidth = 0;
+  uint32_t _environmentTableHeight = 0;
+  bool _environmentSampling = true;
+  uint32_t _maxSamples = 0;
   VkSampler _materialSampler = VK_NULL_HANDLE;
   Buffer<InstanceData> _instanceBuffer;
   RenderBucket _renderBucket;

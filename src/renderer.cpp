@@ -3,8 +3,15 @@
 
 #include "math_helper.h"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
+#include <glm/gtc/constants.hpp>
+#include <glm/packing.hpp>
+#include <fstream>
+#include <iostream>
+#include <numeric>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <imgui.h>
@@ -29,10 +36,14 @@ enum Binding : uint32_t {
   kBindingTlas = 11,
   kBindingAccumulation = 12,
   kBindingTriangleMeshlets = 13,
-  kBindingCount = 14,
+  kBindingEnvironmentAlias = 14,
+  kBindingCount = 15,
 };
-// bindings 0..8 and kBindingTriangleMeshlets
-constexpr uint32_t kStorageBufferBindingCount = 10;
+// bindings 0..8, kBindingTriangleMeshlets and kBindingEnvironmentAlias
+constexpr uint32_t kStorageBufferBindingCount = 11;
+// the environment alias table is built from the HDR shrunk to at most this
+// width; windows and other small lights stay resolved at 512x256.
+constexpr uint32_t kEnvironmentTableMaxWidth = 512;
 // every shader stage shares one pipeline layout
 constexpr VkShaderStageFlags kDrawStages =
     VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT |
@@ -51,6 +62,92 @@ std::string formatNumber(uint64_t value) {
     text.insert(static_cast<size_t>(insertPosition), ",");
   }
   return text;
+}
+
+// Vose's alias method: O(1) sampling of texel k with probability
+// weights[k] / sum(weights).
+std::vector<EnvironmentAliasEntry>
+buildAliasTable(const std::vector<double> &weights) {
+  const size_t count = weights.size();
+  const double total = std::accumulate(weights.begin(), weights.end(), 0.0);
+  std::vector<EnvironmentAliasEntry> table(count);
+  std::vector<double> scaled(count);
+  std::vector<uint32_t> small;
+  std::vector<uint32_t> large;
+  for (size_t i = 0; i < count; ++i) {
+    // probability * count, which is also the texel's density over [0,1]^2
+    scaled[i] = weights[i] / total * static_cast<double>(count);
+    table[i].pdf = static_cast<float>(scaled[i]);
+    (scaled[i] < 1.0 ? small : large).push_back(static_cast<uint32_t>(i));
+  }
+  while (!small.empty() && !large.empty()) {
+    const uint32_t lower = small.back();
+    small.pop_back();
+    const uint32_t upper = large.back();
+    table[lower].probability = static_cast<float>(scaled[lower]);
+    table[lower].alias = upper;
+    // upper fills the rest of lower's bucket
+    scaled[upper] -= 1.0 - scaled[lower];
+    if (scaled[upper] < 1.0) {
+      large.pop_back();
+      small.push_back(upper);
+    }
+  }
+  // whatever is left is 1 up to rounding
+  for (const std::vector<uint32_t> *rest : {&small, &large}) {
+    for (const uint32_t i : *rest) {
+      table[i].probability = 1.0f;
+      table[i].alias = i;
+    }
+  }
+  return table;
+}
+
+// weights each texel of a box-filtered copy of the HDR by luminance *
+// sin(theta), so samples are spread by solid angle rather than by texel.
+std::vector<EnvironmentAliasEntry>
+buildEnvironmentAliasTable(const HdrImage &image, uint32_t &tableWidth,
+                           uint32_t &tableHeight) {
+  const uint32_t factor =
+      std::max(1u, image.width / kEnvironmentTableMaxWidth);
+  tableWidth = std::max(1u, image.width / factor);
+  tableHeight = std::max(1u, image.height / factor);
+
+  std::vector<double> weights(size_t{tableWidth} * tableHeight, 0.0);
+  for (uint32_t y = 0; y < tableHeight; ++y) {
+    const double theta = (y + 0.5) / tableHeight * glm::pi<double>();
+    const double sinTheta = std::sin(theta);
+    for (uint32_t x = 0; x < tableWidth; ++x) {
+      double luminance = 0.0;
+      uint32_t texelCount = 0;
+      for (uint32_t dy = 0; dy < factor; ++dy) {
+        for (uint32_t dx = 0; dx < factor; ++dx) {
+          const uint32_t sx = x * factor + dx;
+          const uint32_t sy = y * factor + dy;
+          if (sx >= image.width || sy >= image.height) {
+            continue;
+          }
+          const size_t texel = (size_t{sy} * image.width + sx) * 4;
+          const glm::vec2 rg = glm::unpackHalf2x16(
+              image.rgbaHalf[texel] | (uint32_t{image.rgbaHalf[texel + 1]} << 16));
+          const float b =
+              glm::unpackHalf2x16(image.rgbaHalf[texel + 2]).x;
+          luminance += 0.2126 * rg.x + 0.7152 * rg.y + 0.0722 * b;
+          ++texelCount;
+        }
+      }
+      weights[size_t{y} * tableWidth + x] =
+          std::max(luminance / std::max(texelCount, 1u), 0.0) * sinTheta;
+    }
+  }
+
+  // every direction that can carry light needs a non-zero density
+  const double mean = std::accumulate(weights.begin(), weights.end(), 0.0) /
+                      static_cast<double>(weights.size());
+  for (double &weight : weights) {
+    weight = std::max(weight, mean * 1e-4);
+  }
+  return buildAliasTable(weights);
 }
 
 InstanceData makeInstanceData(const Object3D &object,
@@ -80,6 +177,11 @@ void Renderer::init() {
   createDescriptorPool();
   createDescriptorSet();
   createSampler();
+  // placeholder until setEnvironment; keeps the binding valid
+  uploadDeviceLocalBuffer(std::vector<EnvironmentAliasEntry>(1),
+                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                          _environmentAliasBuffer);
+  writeEnvironmentAliasDescriptor();
 
   const RenderTargetInfo renderTarget = _vkContext.renderTargetInfo();
   _accumulationImage = _vkContext.createStorageImage(
@@ -124,6 +226,7 @@ void Renderer::cleanup() {
     _vkContext.destroyBuffer(_materialBuffer);
     _vkContext.destroyBuffer(_meshletTriangleBuffer);
     _vkContext.destroyBuffer(_triangleMeshletBuffer);
+    _vkContext.destroyBuffer(_environmentAliasBuffer);
     _vkContext.destroyTexture(_accumulationImage);
     _rayTracingScene.destroy();
     _vkContext.destroyBuffer(_meshletVertexRefBuffer);
@@ -159,6 +262,12 @@ void Renderer::createDescriptorSetLayout() {
   }
   bindings[kBindingTriangleMeshlets] = {
       .binding = kBindingTriangleMeshlets,
+      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+      .descriptorCount = 1,
+      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+  };
+  bindings[kBindingEnvironmentAlias] = {
+      .binding = kBindingEnvironmentAlias,
       .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
       .descriptorCount = 1,
       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
@@ -742,6 +851,77 @@ void Renderer::buildBlas(const MeshUploadInfo &mesh) {
                            indices);
 }
 
+void Renderer::saveAccumulation(const std::filesystem::path &path) {
+  const RenderTargetInfo renderTarget = _vkContext.renderTargetInfo();
+  const uint32_t width = renderTarget.extent.width;
+  const uint32_t height = renderTarget.extent.height;
+  const size_t pixelCount = size_t{width} * height;
+
+  _vkContext.waitIdle();
+  Buffer<glm::vec4> readback;
+  _vkContext.createBuffer(pixelCount * sizeof(glm::vec4),
+                          VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                          readback);
+  _vkContext.immediateSubmit([&](VkCommandBuffer commandBuffer) {
+    VkMemoryBarrier barrier{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+    };
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0,
+                         nullptr, 0, nullptr);
+    VkBufferImageCopy region{
+        .imageSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                             .layerCount = 1},
+        .imageExtent = {.width = width, .height = height, .depth = 1},
+    };
+    vkCmdCopyImageToBuffer(commandBuffer, _accumulationImage.image,
+                           VK_IMAGE_LAYOUT_GENERAL, readback.buffer, 1,
+                           &region);
+  });
+
+  void *mapped = nullptr;
+  vmaMapMemory(_vkContext.allocator(), readback.allocation, &mapped);
+  const auto *pixels = static_cast<const glm::vec4 *>(mapped);
+  // PFM: little-endian (negative scale), RGB floats, rows bottom to top
+  std::ofstream file(path, std::ios::binary);
+  file << "PF\n" << width << ' ' << height << "\n-1.0\n";
+  std::vector<float> row(size_t{width} * 3);
+  for (uint32_t y = height; y-- > 0;) {
+    for (uint32_t x = 0; x < width; ++x) {
+      const glm::vec4 &pixel = pixels[size_t{y} * width + x];
+      row[x * 3 + 0] = pixel.r;
+      row[x * 3 + 1] = pixel.g;
+      row[x * 3 + 2] = pixel.b;
+    }
+    file.write(reinterpret_cast<const char *>(row.data()),
+               static_cast<std::streamsize>(row.size() * sizeof(float)));
+  }
+  vmaUnmapMemory(_vkContext.allocator(), readback.allocation);
+  _vkContext.destroyBuffer(readback);
+  std::cout << "saved " << _sampleIndex << " samples to " << path.string()
+            << std::endl;
+}
+
+void Renderer::writeEnvironmentAliasDescriptor() {
+  VkDescriptorBufferInfo bufferInfo{
+      .buffer = _environmentAliasBuffer.buffer,
+      .range = VK_WHOLE_SIZE,
+  };
+  VkWriteDescriptorSet descriptorWrite{
+      .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+      .dstSet = _descriptorSet,
+      .dstBinding = kBindingEnvironmentAlias,
+      .descriptorCount = 1,
+      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+      .pBufferInfo = &bufferInfo,
+  };
+  vkUpdateDescriptorSets(_vkContext.device(), 1, &descriptorWrite, 0, nullptr);
+}
+
 void Renderer::setEnvironment(const HdrImage &image) {
   assert(_environmentTexture == kInvalidTexture &&
          "replacing the environment is not supported yet");
@@ -754,6 +934,12 @@ void Renderer::setEnvironment(const HdrImage &image) {
   _environmentMaxMip =
       std::floor(std::log2(static_cast<float>(std::max(image.width,
                                                        image.height))));
+
+  uploadDeviceLocalBuffer(
+      buildEnvironmentAliasTable(image, _environmentTableWidth,
+                                 _environmentTableHeight),
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, _environmentAliasBuffer);
+  writeEnvironmentAliasDescriptor();
   // materials may not be loaded yet, so the texture array is written with
   // the rest of the mesh descriptors.
   if (!_materials.empty()) {
@@ -1076,6 +1262,7 @@ void Renderer::renderImgui(VkCommandBuffer commandBuffer, float dt) {
     ImGui::Text("samples: %u", _sampleIndex);
     ImGui::SetNextItemWidth(160.0f);
     ImGui::SliderInt("max bounces", &_maxBounces, 0, 16);
+    ImGui::Checkbox("environment sampling (MIS)", &_environmentSampling);
   }
   int debugView = static_cast<int>(_debugView);
   ImGui::SetNextItemWidth(160.0f);
@@ -1230,7 +1417,8 @@ void Renderer::recordCommandBuffer(const FrameContext &frame, float dt) {
          "failed to begin recording command buffer");
 
   recordCounterReset(commandBuffer);
-  if (_renderMode == RenderMode::PathTracing) {
+  if (_renderMode == RenderMode::PathTracing &&
+      (_maxSamples == 0 || _sampleIndex < _maxSamples)) {
     recordPathTracing(commandBuffer);
   }
   recordRenderingCommands(commandBuffer, frame, dt);
@@ -1263,7 +1451,9 @@ void Renderer::render(const glm::mat4 &viewProjection,
   recordCommandBuffer(frame, dt);
   _vkContext.endFrame(frame);
   if (_renderMode == RenderMode::PathTracing) {
-    ++_sampleIndex;
+    if (_maxSamples == 0 || _sampleIndex < _maxSamples) {
+      ++_sampleIndex;
+    }
   } else {
     // re-entering path tracing starts from scratch
     _accumulatedState = {};
@@ -1292,6 +1482,9 @@ Renderer::makePushConstants(const glm::mat4 &viewProjection,
       .environmentIntensity = _environmentIntensity,
       .environmentMaxMip = _environmentMaxMip,
       .maxBounces = static_cast<uint32_t>(_maxBounces),
+      .environmentTableWidth = _environmentTableWidth,
+      .environmentTableHeight = _environmentTableHeight,
+      .environmentSampling = _environmentSampling ? 1u : 0u,
   };
 }
 

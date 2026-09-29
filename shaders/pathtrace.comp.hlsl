@@ -139,10 +139,33 @@ float luminance(float3 color) {
   return dot(color, float3(0.2126, 0.7152, 0.0722));
 }
 
+float specularLobeProbability(SurfaceProperties material) {
+  return lerp(0.25, 1.0, material.metallic);
+}
+
+// density of the BRDF sampling below producing l: a mixture of the GGX and
+// cosine lobes, so either choice is weighted correctly.
+float brdfSamplePdf(SurfaceProperties material, float3 n, float3 v, float3 l) {
+  const float alpha = max(material.roughness * material.roughness, 1e-3);
+  const float specularProbability = specularLobeProbability(material);
+  return specularProbability * ggxReflectionPdf(n, v, l, alpha) +
+         (1.0 - specularProbability) * saturate(dot(n, l)) / kPi;
+}
+
+// power heuristic (beta = 2)
+float misWeight(float pdf, float otherPdf) {
+  const float a = pdf * pdf;
+  const float b = otherPdf * otherPdf;
+  return a + b > 0.0 ? a / (a + b) : 0.0;
+}
+
 float3 tracePath(float3 origin, float3 direction, inout Rng rng) {
   float3 radiance = 0.0;
   float3 throughput = 1.0;
   const float3 toLight = -normalize(pc.lightDirection.xyz);
+  const bool environmentSampling = hasEnvironmentSampling();
+  // pdf of the BRDF sample that produced `direction`
+  float lastBrdfPdf = 0.0;
 
   for (uint bounce = 0u; bounce <= pc.maxBounces; ++bounce) {
     RayQuery<RAY_FLAG_FORCE_OPAQUE> query;
@@ -155,7 +178,13 @@ float3 tracePath(float3 origin, float3 direction, inout Rng rng) {
     query.Proceed();
 
     if (query.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
-      radiance += throughput * sampleEnvironment(direction, 0.0);
+      // camera rays see the environment directly; bounce rays share it with
+      // the environment light sample taken at the previous hit
+      const float weight =
+          environmentSampling && bounce > 0u
+              ? misWeight(lastBrdfPdf, environmentPdf(direction))
+              : 1.0;
+      radiance += throughput * sampleEnvironment(direction, 0.0) * weight;
       break;
     }
 
@@ -179,12 +208,28 @@ float3 tracePath(float3 origin, float3 direction, inout Rng rng) {
                   kLightColor * pc.lightDirection.w;
     }
 
+    // environment light sample, weighted against BRDF sampling finding the
+    // same direction
+    if (environmentSampling) {
+      float environmentSamplePdf;
+      const float3 l = sampleEnvironmentDirection(
+          float4(nextFloat(rng), nextFloat(rng), nextFloat(rng),
+                 nextFloat(rng)),
+          environmentSamplePdf);
+      if (environmentSamplePdf > 0.0 && dot(n, l) > 0.0 &&
+          dot(hit.geometricNormal, l) > 0.0 && isVisible(nextOrigin, l)) {
+        const float weight = misWeight(
+            environmentSamplePdf, brdfSamplePdf(hit.material, n, v, l));
+        radiance += throughput * evaluateBrdf(hit.material, n, v, l) *
+                    sampleEnvironment(l, 0.0) * (weight / environmentSamplePdf);
+      }
+    }
+
     // pick the specular or diffuse lobe; the pdf below is the mixture of both
     // so either choice is weighted correctly.
     const float alpha =
         max(hit.material.roughness * hit.material.roughness, 1e-3);
-    const float specularProbability =
-        lerp(0.25, 1.0, hit.material.metallic);
+    const float specularProbability = specularLobeProbability(hit.material);
     const float2 u = float2(nextFloat(rng), nextFloat(rng));
     const float3 l = nextFloat(rng) < specularProbability
                          ? sampleGgxReflection(n, v, alpha, u)
@@ -193,11 +238,11 @@ float3 tracePath(float3 origin, float3 direction, inout Rng rng) {
     if (nDotL <= 0.0 || dot(hit.geometricNormal, l) <= 0.0) {
       break;
     }
-    const float pdf = specularProbability * ggxReflectionPdf(n, v, l, alpha) +
-                      (1.0 - specularProbability) * nDotL / kPi;
+    const float pdf = brdfSamplePdf(hit.material, n, v, l);
     if (pdf <= 0.0) {
       break;
     }
+    lastBrdfPdf = pdf;
     throughput *= evaluateBrdf(hit.material, n, v, l) / pdf;
 
     if (bounce >= kRussianRouletteStart) {
